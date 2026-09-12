@@ -50,6 +50,10 @@ class DetectionConfig:
     duplicate_overlap_fraction: float = 0.60
     duplicate_gap_hu: float = 50.0
     duplicate_gap_fraction: float = 0.70
+    # User-selected strict duplicate tolerance: only nearly identical tracks
+    # may contribute to the continuous centreline-overlap rule test.
+    duplicate_centreline_overlap_mm: float = 5.0
+    duplicate_centreline_distance_mm: float = 0.1
 
 
 def _bbox(binary: np.ndarray, margin: np.ndarray) -> tuple[slice, ...]:
@@ -165,7 +169,12 @@ def _rooted_tree(adjacency, root):
 
 
 def _sample(array, points, order=1):
-    return ndi.map_coordinates(array.astype(float, copy=False), np.asarray(points).T,
+    # ``astype(float)`` copied the entire 3D CT for every small sampling call
+    # when the input was float32. Duplicate checking can make thousands of
+    # calls, so that hidden copy dominated both run time and memory. SciPy can
+    # sample the original numeric array directly.
+    values = np.asarray(array)
+    return ndi.map_coordinates(values, np.asarray(points, dtype=float).T,
                                order=order, mode="constant", cval=0, prefilter=False)
 
 
@@ -224,6 +233,50 @@ def _path_positions(branch, spacing, distances):
     )
 
 
+def _dense_physical_path(branch, step_mm=0.25):
+    path = np.asarray(branch["centreline_xyz_mm"], dtype=float)
+    cumulative = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+    keep = np.r_[True, np.diff(cumulative) > 1e-8]
+    path, cumulative = path[keep], cumulative[keep]
+    distances = np.unique(np.r_[np.arange(0.0, cumulative[-1], step_mm), cumulative[-1]])
+    samples = np.column_stack(
+        [np.interp(distances, cumulative, path[:, axis]) for axis in range(3)]
+    )
+    return samples, distances
+
+
+def _longest_close_run(close, distances):
+    longest = 0.0
+    start = None
+    for index, is_close in enumerate(np.r_[close, False]):
+        if is_close and start is None:
+            start = index
+        elif not is_close and start is not None:
+            longest = max(longest, float(distances[index - 1] - distances[start]))
+            start = None
+    return longest
+
+
+def _centreline_overlap_length_mm(
+    first, second, distance_mm, first_dense=None, second_dense=None
+):
+    """Longest symmetric physical path length whose centrelines coincide."""
+    first_path, first_distance = (
+        first_dense if first_dense is not None else _dense_physical_path(first)
+    )
+    second_path, second_distance = (
+        second_dense if second_dense is not None else _dense_physical_path(second)
+    )
+    pairwise = np.linalg.norm(
+        first_path[:, None, :] - second_path[None, :, :], axis=2
+    )
+    first_run = _longest_close_run(pairwise.min(axis=1) < distance_mm, first_distance)
+    second_run = _longest_close_run(pairwise.min(axis=0) < distance_mm, second_distance)
+    # Both paths must account for the same shared extent; this avoids treating a
+    # short crossing through a densely sampled long path as prolonged overlap.
+    return min(first_run, second_run)
+
+
 def _intensity_gap_fraction(ct, first, second, config):
     """Fraction of paired 3D stations with a persistent low-HU interval.
 
@@ -232,39 +285,65 @@ def _intensity_gap_fraction(ct, first, second, config):
     whose centres are too close to contain an independently sampled gap are not
     counted as evidence either way.
     """
-    clear, comparable = 0, 0
+    if len(first) == 0:
+        return 0.0, 0
     fractions = np.linspace(0.0, 1.0, 13)
-    for point_a, point_b in zip(first, second):
-        if np.linalg.norm(point_a - point_b) < 1e-8:
-            continue
-        line = point_a[None, :] + fractions[:, None] * (point_b - point_a)[None, :]
-        profile = _sample(ct, line)
-        if not np.all(np.isfinite(profile)):
-            continue
-        comparable += 1
-        threshold = min(float(profile[0]), float(profile[-1])) - config.duplicate_gap_hu
-        low = profile[2:-2] <= threshold
-        # Require adjacent samples so isolated noise does not protect a duplicate.
-        if np.any(low[:-1] & low[1:]):
-            clear += 1
-    return (clear / comparable if comparable else 0.0), comparable
+    segments = first[:, None, :] + fractions[None, :, None] * (
+        second - first
+    )[:, None, :]
+    profiles = _sample(ct, segments.reshape(-1, 3)).reshape(len(first), -1)
+    valid = np.all(np.isfinite(profiles), axis=1)
+    comparable = int(np.count_nonzero(valid))
+    if not comparable:
+        return 0.0, 0
+    profiles = profiles[valid]
+    thresholds = np.minimum(profiles[:, 0], profiles[:, -1]) - config.duplicate_gap_hu
+    low = profiles[:, 2:-2] <= thresholds[:, None]
+    # Require adjacent samples so isolated noise does not protect a duplicate.
+    clear = int(np.count_nonzero(np.any(low[:, :-1] & low[:, 1:], axis=1)))
+    return clear / comparable, comparable
 
 
-def _duplicate_evidence(first, second, image_np, spacing, config):
-    """Compare the last part of two paths near the requested 10 mm extent."""
+def _dense_paths_can_overlap(first_dense, second_dense, distance_mm):
+    """Cheap necessary test for the configured centreline-overlap rule.
+
+    The final duplicate rule cannot pass unless at least one pair of the same
+    dense samples is closer than distance_mm. Rejecting all other pairs before
+    CT sampling keeps distant branches out of the expensive gap check without
+    changing which pair can ultimately be merged.
+    """
+    first_path = first_dense[0]
+    second_path = second_dense[0]
+    first_min, first_max = first_path.min(axis=0), first_path.max(axis=0)
+    second_min, second_max = second_path.min(axis=0), second_path.max(axis=0)
+    axis_gap = np.maximum(0.0, np.maximum(first_min - second_max,
+                                         second_min - first_max))
+    if np.linalg.norm(axis_gap) >= distance_mm:
+        return False
+    squared_limit = distance_mm * distance_mm
+    for start in range(0, len(first_path), 64):
+        delta = (
+            first_path[start:start + 64, None, :]
+            - second_path[None, :, :]
+        )
+        if np.any(np.einsum("ijk,ijk->ij", delta, delta) < squared_limit):
+            return True
+    return False
+
+
+def _duplicate_evidence(
+    first,
+    second,
+    image_np,
+    spacing,
+    config,
+    same_component=True,
+    first_dense=None,
+    second_dense=None,
+):
+    """Use a low-HU gap first, then test sustained centreline overlap."""
     common_end = min(float(first["path_length_mm"]), float(second["path_length_mm"]),
                      config.max_path_length_mm)
-    # A path may end up to about two thick voxels before 10 mm. Anything shorter
-    # has insufficient distal evidence and is left untouched.
-    required = max(config.seed_distance_mm,
-                   config.max_path_length_mm - max(1.0, 2.0 * float(max(spacing))))
-    if common_end < required:
-        return {
-            "comparable": False,
-            "common_length_mm": common_end,
-            "reason": "insufficient_path_towards_10mm",
-        }
-
     tail_start = max(config.seed_distance_mm,
                      common_end - config.duplicate_tail_length_mm)
     tail_distances = np.linspace(tail_start, common_end, 7)
@@ -274,11 +353,6 @@ def _duplicate_evidence(first, second, image_np, spacing, config):
     combined_radius = float(first["radius_mm"] + second["radius_mm"])
     overlap_limit = config.duplicate_overlap_radius_factor * combined_radius
     overlap_fraction = float(np.mean(separations <= overlap_limit))
-    paths_still_joined = (
-        float(separations[-1]) <= overlap_limit
-        and overlap_fraction >= config.duplicate_overlap_fraction
-    )
-
     gap_start = min(max(1.0, config.seed_distance_mm / 2.0), common_end)
     gap_distances = np.arange(gap_start, common_end + 1e-6, 0.75)
     first_gap = _path_positions(first, spacing, gap_distances)
@@ -296,31 +370,66 @@ def _duplicate_evidence(first, second, image_np, spacing, config):
     clear_intensity_gap = (
         gap_stations >= 3 and gap_fraction >= config.duplicate_gap_fraction
     )
-    return {
-        "comparable": True,
+    evidence = {
+        "same_component": bool(same_component),
         "common_length_mm": common_end,
+        "centreline_overlap_threshold_mm": config.duplicate_centreline_overlap_mm,
+        "comparable": True,
         "distal_separation_mm": float(separations[-1]),
         "distal_overlap_fraction": overlap_fraction,
         "clear_intensity_gap": clear_intensity_gap,
         "intensity_gap_fraction": float(gap_fraction),
         "intensity_gap_stations": int(gap_stations),
-        "possible_duplicate": bool(paths_still_joined and not clear_intensity_gap),
+    }
+    if clear_intensity_gap:
+        return {
+            **evidence,
+            "centreline_check_skipped": True,
+            "centreline_overlap_mm": 0.0,
+            "reason": "persistent_low_intensity_gap",
+            "possible_duplicate": False,
+        }
+
+    centreline_overlap = _centreline_overlap_length_mm(
+        first,
+        second,
+        config.duplicate_centreline_distance_mm,
+        first_dense=first_dense,
+        second_dense=second_dense,
+    )
+    overlap_duplicate = (
+        centreline_overlap > config.duplicate_centreline_overlap_mm + 1e-6
+    )
+    return {
+        **evidence,
+        "centreline_check_skipped": False,
+        "centreline_overlap_mm": float(centreline_overlap),
+        "reason": (
+            "centreline_overlap_over_threshold"
+            if overlap_duplicate else "no_sustained_near_identical_overlap"
+        ),
+        "possible_duplicate": overlap_duplicate,
     }
 
 
 def _remove_duplicate_branches(results, image_np, spacing, config):
-    """Collapse candidates that remain one lumen near 10 mm.
+    """Collapse candidates only for sustained near-identical centrelines.
 
-    Only openings from the same threshold-connected 3D structure are eligible
-    for merging. A repeated low-HU interval along the paths overrides the merge,
-    preserving two vessels that remain visibly separated in the raw CT.
+    Any pair whose centrelines remain within the configured distance for longer
+    than the configured overlap length is eligible for
+    merging, even when threshold fragmentation assigned different components.
+    A persistent low-HU interval preserves two distinct vessels. Distal
+    proximity near 10 mm is reported but no longer triggers a merge.
     """
     if len(results) < 2:
         for branch in results:
             branch["quality"]["duplicate_check"] = {
                 "status": "unique",
                 "same_component_comparisons": 0,
+                "pairwise_comparisons": 0,
+                "distant_comparisons_skipped": 0,
                 "removed_candidates": 0,
+                "maximum_centreline_overlap_mm": 0.0,
             }
         return results, 0
 
@@ -338,13 +447,29 @@ def _remove_duplicate_branches(results, image_np, spacing, config):
             parent[second] = first
 
     comparisons = [[] for _ in results]
+    skipped_distant = np.zeros(len(results), dtype=int)
+    dense_paths = [_dense_physical_path(branch) for branch in results]
     duplicate_pairs = []
     for first in range(len(results)):
         for second in range(first + 1, len(results)):
-            if results[first]["_component_id"] != results[second]["_component_id"]:
+            # A pair that cannot satisfy the strict <0.1 mm centreline rule can
+            # never be merged. Skip its much more expensive 3D HU profile test.
+            if not _dense_paths_can_overlap(
+                dense_paths[first],
+                dense_paths[second],
+                config.duplicate_centreline_distance_mm,
+            ):
+                skipped_distant[first] += 1
+                skipped_distant[second] += 1
                 continue
+            same_component = (
+                results[first]["_component_id"] == results[second]["_component_id"]
+            )
             evidence = _duplicate_evidence(
-                results[first], results[second], image_np, spacing, config
+                results[first], results[second], image_np, spacing, config,
+                same_component=same_component,
+                first_dense=dense_paths[first],
+                second_dense=dense_paths[second],
             )
             comparisons[first].append(evidence)
             comparisons[second].append(evidence)
@@ -376,13 +501,24 @@ def _remove_duplicate_branches(results, image_np, spacing, config):
         ]
         branch["quality"]["duplicate_check"] = {
             "status": "representative_after_merge" if merged else "unique",
-            "same_component_comparisons": len(comparisons[representative]),
+            "same_component_comparisons": sum(
+                item.get("same_component", False)
+                for item in comparisons[representative]
+            ),
+            "pairwise_comparisons": len(comparisons[representative]),
+            "distant_comparisons_skipped": int(skipped_distant[representative]),
             "removed_candidates": merged,
             "minimum_distal_separation_mm": (
                 min(item["distal_separation_mm"] for item in comparisons[representative]
-                    if item.get("comparable"))
-                if any(item.get("comparable") for item in comparisons[representative])
+                    if "distal_separation_mm" in item)
+                if any("distal_separation_mm" in item
+                       for item in comparisons[representative])
                 else None
+            ),
+            "maximum_centreline_overlap_mm": (
+                max(item["centreline_overlap_mm"]
+                    for item in comparisons[representative])
+                if comparisons[representative] else 0.0
             ),
             "clear_intensity_gap_seen": any(
                 item.get("clear_intensity_gap", False)
@@ -424,7 +560,9 @@ def detect_branches(
                   config.max_seed_radius_mm, config.duplicate_tail_length_mm,
                   config.duplicate_overlap_radius_factor,
                   config.duplicate_overlap_fraction, config.duplicate_gap_hu,
-                  config.duplicate_gap_fraction):
+                  config.duplicate_gap_fraction,
+                  config.duplicate_centreline_overlap_mm,
+                  config.duplicate_centreline_distance_mm):
         if not np.isfinite(value) or value <= 0:
             raise ValueError("Detection thresholds must be finite and positive")
     if (config.duplicate_overlap_fraction > 1.0
@@ -592,8 +730,9 @@ def detect_branches(
     if duplicate_count:
         warnings.warn(
             f"Removed {duplicate_count} possible duplicate branch candidate(s) "
-            "that remained joined near the 10 mm trace extent without a "
-            "persistent low-intensity gap.",
+            f"because their centrelines remained within "
+            f"{config.duplicate_centreline_distance_mm:g} mm for more than "
+            f"{config.duplicate_centreline_overlap_mm:g} mm.",
             RuntimeWarning, stacklevel=2,
         )
     if early_forks:
