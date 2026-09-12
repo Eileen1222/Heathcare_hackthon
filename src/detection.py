@@ -45,6 +45,11 @@ class DetectionConfig:
     spur_length_mm: float = 1.5
     max_cross_section_ratio: float = 2.5
     max_seed_radius_mm: float = 8.0
+    duplicate_tail_length_mm: float = 2.0
+    duplicate_overlap_radius_factor: float = 0.75
+    duplicate_overlap_fraction: float = 0.60
+    duplicate_gap_hu: float = 50.0
+    duplicate_gap_fraction: float = 0.70
 
 
 def _bbox(binary: np.ndarray, margin: np.ndarray) -> tuple[slice, ...]:
@@ -206,6 +211,189 @@ def _cross_section(vessel, point, tangent, spacing, max_radius):
     return radius, ratio
 
 
+def _path_positions(branch, spacing, distances):
+    path = np.asarray(branch["centreline_zyx"], dtype=float)
+    cumulative = np.r_[
+        0.0,
+        np.cumsum(np.linalg.norm(np.diff(path, axis=0) * spacing, axis=1)),
+    ]
+    keep = np.r_[True, np.diff(cumulative) > 1e-8]
+    path, cumulative = path[keep], cumulative[keep]
+    return np.column_stack(
+        [np.interp(distances, cumulative, path[:, axis]) for axis in range(3)]
+    )
+
+
+def _intensity_gap_fraction(ct, first, second, config):
+    """Fraction of paired 3D stations with a persistent low-HU interval.
+
+    A single noisy voxel is not enough: the interval must contain at least two
+    interior samples and must recur along most of the compared path. Stations
+    whose centres are too close to contain an independently sampled gap are not
+    counted as evidence either way.
+    """
+    clear, comparable = 0, 0
+    fractions = np.linspace(0.0, 1.0, 13)
+    for point_a, point_b in zip(first, second):
+        if np.linalg.norm(point_a - point_b) < 1e-8:
+            continue
+        line = point_a[None, :] + fractions[:, None] * (point_b - point_a)[None, :]
+        profile = _sample(ct, line)
+        if not np.all(np.isfinite(profile)):
+            continue
+        comparable += 1
+        threshold = min(float(profile[0]), float(profile[-1])) - config.duplicate_gap_hu
+        low = profile[2:-2] <= threshold
+        # Require adjacent samples so isolated noise does not protect a duplicate.
+        if np.any(low[:-1] & low[1:]):
+            clear += 1
+    return (clear / comparable if comparable else 0.0), comparable
+
+
+def _duplicate_evidence(first, second, image_np, spacing, config):
+    """Compare the last part of two paths near the requested 10 mm extent."""
+    common_end = min(float(first["path_length_mm"]), float(second["path_length_mm"]),
+                     config.max_path_length_mm)
+    # A path may end up to about two thick voxels before 10 mm. Anything shorter
+    # has insufficient distal evidence and is left untouched.
+    required = max(config.seed_distance_mm,
+                   config.max_path_length_mm - max(1.0, 2.0 * float(max(spacing))))
+    if common_end < required:
+        return {
+            "comparable": False,
+            "common_length_mm": common_end,
+            "reason": "insufficient_path_towards_10mm",
+        }
+
+    tail_start = max(config.seed_distance_mm,
+                     common_end - config.duplicate_tail_length_mm)
+    tail_distances = np.linspace(tail_start, common_end, 7)
+    first_tail = _path_positions(first, spacing, tail_distances)
+    second_tail = _path_positions(second, spacing, tail_distances)
+    separations = np.linalg.norm((first_tail - second_tail) * spacing, axis=1)
+    combined_radius = float(first["radius_mm"] + second["radius_mm"])
+    overlap_limit = config.duplicate_overlap_radius_factor * combined_radius
+    overlap_fraction = float(np.mean(separations <= overlap_limit))
+    paths_still_joined = (
+        float(separations[-1]) <= overlap_limit
+        and overlap_fraction >= config.duplicate_overlap_fraction
+    )
+
+    gap_start = min(max(1.0, config.seed_distance_mm / 2.0), common_end)
+    gap_distances = np.arange(gap_start, common_end + 1e-6, 0.75)
+    first_gap = _path_positions(first, spacing, gap_distances)
+    second_gap = _path_positions(second, spacing, gap_distances)
+    # Convert physical separation to voxel coordinates only for the lower bound
+    # on resolvable gaps; actual HU sampling remains trilinear in the 3D CT.
+    physical_separation = np.linalg.norm((first_gap - second_gap) * spacing, axis=1)
+    resolvable = physical_separation >= 1.5 * float(min(spacing))
+    gap_fraction, gap_stations = _intensity_gap_fraction(
+        image_np,
+        first_gap[resolvable],
+        second_gap[resolvable],
+        config,
+    )
+    clear_intensity_gap = (
+        gap_stations >= 3 and gap_fraction >= config.duplicate_gap_fraction
+    )
+    return {
+        "comparable": True,
+        "common_length_mm": common_end,
+        "distal_separation_mm": float(separations[-1]),
+        "distal_overlap_fraction": overlap_fraction,
+        "clear_intensity_gap": clear_intensity_gap,
+        "intensity_gap_fraction": float(gap_fraction),
+        "intensity_gap_stations": int(gap_stations),
+        "possible_duplicate": bool(paths_still_joined and not clear_intensity_gap),
+    }
+
+
+def _remove_duplicate_branches(results, image_np, spacing, config):
+    """Collapse candidates that remain one lumen near 10 mm.
+
+    Only openings from the same threshold-connected 3D structure are eligible
+    for merging. A repeated low-HU interval along the paths overrides the merge,
+    preserving two vessels that remain visibly separated in the raw CT.
+    """
+    if len(results) < 2:
+        for branch in results:
+            branch["quality"]["duplicate_check"] = {
+                "status": "unique",
+                "same_component_comparisons": 0,
+                "removed_candidates": 0,
+            }
+        return results, 0
+
+    parent = list(range(len(results)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        first, second = find(first), find(second)
+        if first != second:
+            parent[second] = first
+
+    comparisons = [[] for _ in results]
+    duplicate_pairs = []
+    for first in range(len(results)):
+        for second in range(first + 1, len(results)):
+            if results[first]["_component_id"] != results[second]["_component_id"]:
+                continue
+            evidence = _duplicate_evidence(
+                results[first], results[second], image_np, spacing, config
+            )
+            comparisons[first].append(evidence)
+            comparisons[second].append(evidence)
+            if evidence.get("possible_duplicate", False):
+                union(first, second)
+                duplicate_pairs.append((first, second, evidence))
+
+    groups = {}
+    for index in range(len(results)):
+        groups.setdefault(find(index), []).append(index)
+
+    kept = []
+    removed = 0
+    for members in groups.values():
+        representative = max(
+            members,
+            key=lambda index: (
+                float(results[index]["path_length_mm"]),
+                float(results[index]["ostium_radius_mm"]),
+                -float(results[index]["quality"]["cross_section_ratio"]),
+            ),
+        )
+        branch = results[representative]
+        merged = len(members) - 1
+        removed += merged
+        relevant = [
+            evidence for first, second, evidence in duplicate_pairs
+            if first in members and second in members
+        ]
+        branch["quality"]["duplicate_check"] = {
+            "status": "representative_after_merge" if merged else "unique",
+            "same_component_comparisons": len(comparisons[representative]),
+            "removed_candidates": merged,
+            "minimum_distal_separation_mm": (
+                min(item["distal_separation_mm"] for item in comparisons[representative]
+                    if item.get("comparable"))
+                if any(item.get("comparable") for item in comparisons[representative])
+                else None
+            ),
+            "clear_intensity_gap_seen": any(
+                item.get("clear_intensity_gap", False)
+                for item in comparisons[representative]
+            ),
+            "merge_evidence": relevant,
+        }
+        kept.append(branch)
+    return kept, removed
+
+
 def detect_branches(
     image: sitk.Image,
     image_np: np.ndarray,
@@ -233,9 +421,15 @@ def detect_branches(
         raise ValueError("Require 0 < seed_distance_mm <= max_path_length_mm")
     for value in (config.intensity_low_tolerance, config.intensity_high_tolerance,
                   config.spur_length_mm, config.max_cross_section_ratio,
-                  config.max_seed_radius_mm):
+                  config.max_seed_radius_mm, config.duplicate_tail_length_mm,
+                  config.duplicate_overlap_radius_factor,
+                  config.duplicate_overlap_fraction, config.duplicate_gap_hu,
+                  config.duplicate_gap_fraction):
         if not np.isfinite(value) or value <= 0:
             raise ValueError("Detection thresholds must be finite and positive")
+    if (config.duplicate_overlap_fraction > 1.0
+            or config.duplicate_gap_fraction > 1.0):
+        raise ValueError("Duplicate-check fractions must not exceed one")
     if config.min_ostium_radius_mm is not None and (
             not np.isfinite(config.min_ostium_radius_mm) or config.min_ostium_radius_mm < 0):
         raise ValueError("min_ostium_radius_mm must be nonnegative or None")
@@ -372,6 +566,7 @@ def detect_branches(
             if np.linalg.norm(np.asarray(seed_xyz) - ostium_xyz) < 1e-8:
                 continue
             results.append({
+                "_component_id": int(component_id),
                 "parent_instance_id": "aorta",
                 "ostium_zyx": global_ostium.tolist(),
                 "seed_zyx": global_seed.tolist(),
@@ -387,9 +582,20 @@ def detect_branches(
                             "stopped_at_bifurcation": stopped_at_fork,
                             "method": "intensity_wall_connection_skeleton"},
             })
+    results, duplicate_count = _remove_duplicate_branches(
+        results, np.asarray(image_np, dtype=np.float32), spacing, config
+    )
     results.sort(key=lambda branch: tuple(branch["ostium_zyx"]))
     for index, branch in enumerate(results, start=1):
+        branch.pop("_component_id", None)
         branch["instance_id"] = f"branch_{index:03d}"
+    if duplicate_count:
+        warnings.warn(
+            f"Removed {duplicate_count} possible duplicate branch candidate(s) "
+            "that remained joined near the 10 mm trace extent without a "
+            "persistent low-intensity gap.",
+            RuntimeWarning, stacklevel=2,
+        )
     if early_forks:
         warnings.warn(
             f"{early_forks} candidate opening(s) bifurcate before the "
