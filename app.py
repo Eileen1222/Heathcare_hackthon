@@ -129,11 +129,6 @@ def render_prediction_viewer(prediction_text: str) -> None:
     components.html(viewer_html, height=515, scrolling=False)
 
 
-@st.cache_resource(show_spinner=False)
-def get_cached_case_result(ct_path_str: str, mask_path_str: str) -> dict[str, Any]:
-    return process_case(ct_path_str, mask_path_str)
-
-
 if "result" not in st.session_state:
     st.session_state.result = None
 if "input_signature" not in st.session_state:
@@ -141,55 +136,26 @@ if "input_signature" not in st.session_state:
 if "active_case_id" not in st.session_state:
     st.session_state.active_case_id = "uploaded_case"
 
-# Discover available preloaded cases in data/
-available_cases: dict[str, tuple[Path, Path]] = {}
-data_dir = Path("data")
-if data_dir.is_dir():
-    for sub_dir in sorted(data_dir.iterdir()):
-        if sub_dir.is_dir():
-            cts = list(sub_dir.glob("orig*.nii*")) + list(sub_dir.glob("image*.nii*"))
-            masks = list(sub_dir.glob("mask*.nii*"))
-            if cts and masks:
-                available_cases[sub_dir.name] = (cts[0], masks[0])
-
 with st.sidebar:
     st.header("Case input")
-    mode_options = ["Preloaded Cases", "Upload NIfTI"] if available_cases else ["Upload NIfTI"]
-    input_mode = st.radio("Input Source", mode_options, horizontal=True)
-
-    ct_upload = None
-    mask_upload = None
-    selected_case = None
-
-    if input_mode == "Preloaded Cases":
-        selected_case = st.selectbox(
-            "Select Benchmark Case",
-            list(available_cases.keys()),
-            format_func=lambda x: f"{x} ({'26 branches' if x == 'subject003' else ('9 branches' if x == 'subject001' else '5 branches')})",
-        )
-        case_id = selected_case
-        run_clicked = st.button("Load / Run Case", type="primary", use_container_width=True)
-    else:
-        case_id = st.text_input("Case ID", value="uploaded_case")
-        ct_upload = st.file_uploader("CTA volume", type=["nii", "gz"])
-        mask_upload = st.file_uploader("Aorta mask", type=["nii", "gz"])
-        run_clicked = st.button(
-            "Run detection",
-            type="primary",
-            use_container_width=True,
-            disabled=ct_upload is None or mask_upload is None,
-        )
+    case_id = st.text_input("Case ID", value="uploaded_case")
+    ct_upload = st.file_uploader("CTA volume", type=["nii", "gz"])
+    mask_upload = st.file_uploader("Aorta mask", type=["nii", "gz"])
+    run_clicked = st.button(
+        "Run detection",
+        type="primary",
+        use_container_width=True,
+        disabled=ct_upload is None or mask_upload is None,
+    )
 
 current_signature = None
-if input_mode == "Preloaded Cases" and selected_case:
-    current_signature = ("preloaded", selected_case)
-elif ct_upload is not None and mask_upload is not None:
+if ct_upload is not None and mask_upload is not None:
     current_signature = (
         upload_signature(ct_upload),
         upload_signature(mask_upload),
     )
 
-# Never display results generated from a different pair of volumes.
+# Never display results generated from a different pair of uploaded volumes.
 if current_signature != st.session_state.input_signature:
     st.session_state.result = None
     st.session_state.input_signature = current_signature
@@ -207,31 +173,22 @@ if run_clicked:
     st.session_state.result = None
     st.session_state.active_case_id = case_id
 
-    if input_mode == "Preloaded Cases" and selected_case:
-        ct_path, mask_path = available_cases[selected_case]
+    with tempfile.TemporaryDirectory(prefix="branchseed-") as temp_dir:
+        temp_path = Path(temp_dir)
+        ct_path = temp_path / (ct_upload.name or "image.nii.gz")
+        mask_path = temp_path / (mask_upload.name or "mask.nii.gz")
+        ct_path.write_bytes(ct_upload.getvalue())
+        mask_path.write_bytes(mask_upload.getvalue())
+
         try:
-            with st.spinner(f"Processing 3D volumes for {selected_case}..."):
-                st.session_state.result = get_cached_case_result(str(ct_path), str(mask_path))
-        except Exception as exc:
+            with st.spinner("Processing 3D volumes..."):
+                st.session_state.result = process_case(ct_path, mask_path)
+        except Exception as exc:  # Streamlit should show actionable input errors.
             st.error(f"Processing failed: {exc}")
             st.stop()
-    else:
-        with tempfile.TemporaryDirectory(prefix="branchseed-") as temp_dir:
-            temp_path = Path(temp_dir)
-            ct_path = temp_path / (ct_upload.name or "image.nii.gz")
-            mask_path = temp_path / (mask_upload.name or "mask.nii.gz")
-            ct_path.write_bytes(ct_upload.getvalue())
-            mask_path.write_bytes(mask_upload.getvalue())
-
-            try:
-                with st.spinner("Processing 3D volumes..."):
-                    st.session_state.result = process_case(ct_path, mask_path)
-            except Exception as exc:  # Streamlit should show actionable input errors.
-                st.error(f"Processing failed: {exc}")
-                st.stop()
 
 if st.session_state.result is None:
-    st.info("Select a preloaded case or upload a CTA volume and matching aorta mask to begin.")
+    st.info("Upload a CTA volume and matching aorta mask to begin.")
     st.stop()
 
 result = st.session_state.result
@@ -429,6 +386,15 @@ def render_ct_viewer(case_result: dict[str, Any], focused_branch_id: str | None)
             "Each branch has one saturated color. Star (★) marks the currently "
             "focused branch. An × marks a seed projected from a nearby slice."
         )
+        st.markdown("#### Image size")
+        slice_height = st.select_slider(
+            "Image size",
+            options=[440, 500, 560, 640],
+            value=500,
+            format_func=lambda x: f"{x}px",
+            key="slice_figure_height",
+            label_visibility="collapsed",
+        )
 
     plane_specs = {
         "Axial (Z)": ("axial", 0, "z", "slice_z"),
@@ -445,6 +411,7 @@ def render_ct_viewer(case_result: dict[str, Any], focused_branch_id: str | None)
         "show_centerlines": show_centerlines,
         "show_radius": show_radius,
         "focused_branch_id": focused_branch_id,
+        "figure_height": slice_height,
     }
 
     def format_intersections(branches: list[dict], axis: int, slice_val: int, spacing: float) -> list[str]:
