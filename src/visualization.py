@@ -1,10 +1,9 @@
-"""2D Matplotlib and interactive 3D Plotly visualizations."""
+"""Interactive 2D and 3D Plotly visualizations."""
 
 from __future__ import annotations
 
 from typing import Any, Iterable
 
-import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import SimpleITK as sitk
@@ -14,12 +13,50 @@ from skimage.measure import marching_cubes
 def create_slice_figure(image_np: np.ndarray, mask_np: np.ndarray, z: int):
     if not 0 <= z < image_np.shape[0]:
         raise IndexError(f"Slice {z} is outside [0, {image_np.shape[0] - 1}]")
-    figure, axis = plt.subplots(figsize=(10, 6))
-    axis.imshow(image_np[z], cmap="gray")
-    axis.imshow(np.ma.masked_where(~mask_np[z].astype(bool), mask_np[z]), cmap="autumn", alpha=0.4)
-    axis.set_title(f"Axial slice z={z}")
-    axis.axis("off")
-    figure.tight_layout()
+
+    image_slice = np.asarray(image_np[z], dtype=float)
+    mask_slice = np.asarray(mask_np[z], dtype=bool)
+    window_min, window_max = np.percentile(image_slice, (1, 99))
+    if window_min == window_max:
+        window_max = window_min + 1.0
+
+    figure = go.Figure()
+    figure.add_trace(
+        go.Heatmap(
+            z=image_slice,
+            colorscale="Gray",
+            zmin=float(window_min),
+            zmax=float(window_max),
+            showscale=False,
+            name="CT",
+            hovertemplate="x=%{x}<br>y=%{y}<br>HU=%{z:.0f}<extra>CT</extra>",
+        )
+    )
+    figure.add_trace(
+        go.Heatmap(
+            z=np.where(mask_slice, 1.0, np.nan),
+            colorscale=[[0.0, "#ff7f0e"], [1.0, "#ff7f0e"]],
+            zmin=0.0,
+            zmax=1.0,
+            showscale=False,
+            opacity=0.4,
+            name="Aorta mask",
+            hoverinfo="skip",
+        )
+    )
+    figure.update_layout(
+        height=480,
+        margin={"l": 10, "r": 10, "t": 45, "b": 10},
+        title={"text": f"Axial slice z={z}", "x": 0.5},
+        dragmode="zoom",
+        xaxis={"visible": False, "constrain": "domain"},
+        yaxis={
+            "visible": False,
+            "autorange": "reversed",
+            "scaleanchor": "x",
+            "scaleratio": 1,
+        },
+    )
     return figure
 
 

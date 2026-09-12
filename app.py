@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import html
 import json
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src.io_utils import make_prediction
 from src.pipeline import process_case
@@ -26,6 +28,105 @@ def upload_signature(upload: Any) -> tuple[str, int, str | None]:
         upload.size,
         getattr(upload, "file_id", None),
     )
+
+
+def render_prediction_viewer(prediction_text: str) -> None:
+    """Render a bounded JSON panel with a browser-native fullscreen control."""
+    escaped_prediction = html.escape(prediction_text)
+    viewer_html = """
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        font-family: "Source Sans Pro", sans-serif;
+      }
+      .prediction-viewer {
+        box-sizing: border-box;
+        height: 515px;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        border: 1px solid rgba(128, 128, 128, 0.35);
+        border-radius: 0.5rem;
+        background: #0e1117;
+        color: #fafafa;
+      }
+      .prediction-toolbar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 42px;
+        padding: 0 0.75rem;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+      }
+      .prediction-toolbar span {
+        font-size: 0.85rem;
+        color: #b8c2cc;
+      }
+      .fullscreen-button {
+        border: 1px solid rgba(128, 128, 128, 0.55);
+        border-radius: 0.35rem;
+        padding: 0.35rem 0.65rem;
+        background: transparent;
+        color: #fafafa;
+        cursor: pointer;
+      }
+      .fullscreen-button:hover {
+        border-color: #ff4b4b;
+        color: #ff6b6b;
+      }
+      pre {
+        flex: 1 1 auto;
+        box-sizing: border-box;
+        min-height: 0;
+        margin: 0;
+        padding: 0.85rem;
+        overflow: auto;
+        white-space: pre;
+        font: 0.82rem/1.45 "Source Code Pro", monospace;
+      }
+      .prediction-viewer:fullscreen {
+        width: 100vw;
+        height: 100vh;
+        border: 0;
+        border-radius: 0;
+      }
+      .prediction-viewer:fullscreen pre {
+        font-size: 1rem;
+        padding: 1.5rem;
+      }
+    </style>
+    <div id="prediction-viewer" class="prediction-viewer">
+      <div class="prediction-toolbar">
+        <span>prediction.json</span>
+        <button id="fullscreen-button" class="fullscreen-button" type="button">
+          ⛶ Full screen
+        </button>
+      </div>
+      <pre>__PREDICTION_JSON__</pre>
+    </div>
+    <script>
+      const viewer = document.getElementById("prediction-viewer");
+      const button = document.getElementById("fullscreen-button");
+
+      button.addEventListener("click", async () => {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        } else {
+          await viewer.requestFullscreen();
+        }
+      });
+
+      document.addEventListener("fullscreenchange", () => {
+        button.textContent = document.fullscreenElement
+          ? "× Exit full screen"
+          : "⛶ Full screen";
+      });
+    </script>
+    """.replace("__PREDICTION_JSON__", escaped_prediction)
+    components.html(viewer_html, height=515, scrolling=False)
 
 
 if "result" not in st.session_state:
@@ -88,17 +189,20 @@ st.success(f'Detected {len(result["branches"])} candidate branches')
 viewer_col, details_col = st.columns([2, 1])
 with viewer_col:
     st.subheader("Interactive 3D aorta")
+    aorta_figure = create_aorta_figure(
+        result["mask_np"], result["mask_image"], result["branches"]
+    )
+    aorta_figure.update_layout(height=600)
     st.plotly_chart(
-        create_aorta_figure(
-            result["mask_np"], result["mask_image"], result["branches"]
-        ),
+        aorta_figure,
         use_container_width=True,
     )
 
 with details_col:
     st.subheader("Prediction")
-    st.json(prediction)
-    payload = json.dumps(prediction, indent=2).encode("utf-8")
+    prediction_text = json.dumps(prediction, indent=2)
+    render_prediction_viewer(prediction_text)
+    payload = prediction_text.encode("utf-8")
     st.download_button(
         "Download prediction.json",
         data=payload,
@@ -115,7 +219,11 @@ slice_index = st.slider(
     result["image_np"].shape[0] // 2,
     key="slice_z",
 )
-st.pyplot(
+st.plotly_chart(
     create_slice_figure(result["image_np"], result["mask_np"], slice_index),
     use_container_width=True,
+    config={
+        "scrollZoom": True,
+        "displaylogo": False,
+    },
 )
