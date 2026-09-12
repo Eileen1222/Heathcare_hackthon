@@ -120,20 +120,6 @@ def create_slice_figure(
     for branch_index, branch in enumerate(branches):
         branch_id = str(branch.get("instance_id", f"branch_{branch_index + 1:03d}"))
         color, centerline_color = branch_palette[branch_index % len(branch_palette)]
-        # A legend-only marker keeps the branch list stable even when the
-        # selected slice does not intersect that branch.
-        figure.add_trace(
-            go.Scatter(
-                x=[None],
-                y=[None],
-                mode="markers",
-                marker={"size": 9, "color": color},
-                name=branch_id,
-                legendgroup=branch_id,
-                showlegend=True,
-                hoverinfo="skip",
-            )
-        )
 
         if show_centerlines and branch.get("centreline_zyx"):
             centreline = np.asarray(branch["centreline_zyx"], dtype=float)
@@ -288,18 +274,7 @@ def create_slice_figure(
             "scaleanchor": "x",
             "scaleratio": 1,
         },
-        legend={
-            "title": {"text": "Branches"},
-            "x": 0.01,
-            "xanchor": "left",
-            "y": 0.99,
-            "yanchor": "top",
-            "bgcolor": "rgba(14, 17, 23, 0.72)",
-            "bordercolor": "rgba(255, 255, 255, 0.25)",
-            "borderwidth": 1,
-            "font": {"color": "#fafafa"},
-            "groupclick": "togglegroup",
-        },
+        showlegend=False,
     )
     return figure
 
