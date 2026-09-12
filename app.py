@@ -157,7 +157,8 @@ if ct_upload is not None and mask_upload is not None:
 if current_signature != st.session_state.input_signature:
     st.session_state.result = None
     st.session_state.input_signature = current_signature
-    st.session_state.pop("slice_z", None)
+    for slice_key in ("slice_z", "slice_y", "slice_x"):
+        st.session_state.pop(slice_key, None)
 
 if run_clicked:
     # Clear the previous result before processing so a failed rerun cannot show
@@ -211,19 +212,94 @@ with details_col:
         use_container_width=True,
     )
 
-st.subheader("Axial CT / mask overlay")
-slice_index = st.slider(
-    "Slice (z)",
-    0,
-    result["image_np"].shape[0] - 1,
-    result["image_np"].shape[0] // 2,
-    key="slice_z",
+st.subheader("CT / detection overlay")
+control_columns = st.columns(4)
+with control_columns[0]:
+    show_mask = st.checkbox("Aorta mask", value=True)
+with control_columns[1]:
+    show_points = st.checkbox("Ostia, seeds & directions", value=True)
+with control_columns[2]:
+    show_centerlines = st.checkbox("Centerlines", value=True)
+with control_columns[3]:
+    show_radius = st.checkbox("Seed radius", value=True)
+
+st.caption(
+    "Yellow circle: ostium · colored diamond: 5 mm seed · "
+    "×: seed projected from a nearby slice · dotted circle: estimated radius"
 )
-st.plotly_chart(
-    create_slice_figure(result["image_np"], result["mask_np"], slice_index),
-    use_container_width=True,
-    config={
-        "scrollZoom": True,
-        "displaylogo": False,
-    },
+slice_plot_config = {
+    "scrollZoom": True,
+    "displaylogo": False,
+}
+spacing_zyx = result["image"].GetSpacing()[::-1]
+slice_options = {
+    "branches": result["branches"],
+    "spacing_zyx": spacing_zyx,
+    "show_mask": show_mask,
+    "show_points": show_points,
+    "show_centerlines": show_centerlines,
+    "show_radius": show_radius,
+}
+
+axial_tab, coronal_tab, sagittal_tab = st.tabs(
+    ["Axial (Z)", "Coronal (Y)", "Sagittal (X)"]
 )
+with axial_tab:
+    slice_z = st.slider(
+        "Axial slice (z)",
+        0,
+        result["image_np"].shape[0] - 1,
+        result["image_np"].shape[0] // 2,
+        key="slice_z",
+    )
+    st.plotly_chart(
+        create_slice_figure(
+            result["image_np"],
+            result["mask_np"],
+            slice_z,
+            plane="axial",
+            **slice_options,
+        ),
+        use_container_width=True,
+        config=slice_plot_config,
+    )
+
+with coronal_tab:
+    slice_y = st.slider(
+        "Coronal slice (y)",
+        0,
+        result["image_np"].shape[1] - 1,
+        result["image_np"].shape[1] // 2,
+        key="slice_y",
+    )
+    st.plotly_chart(
+        create_slice_figure(
+            result["image_np"],
+            result["mask_np"],
+            slice_y,
+            plane="coronal",
+            **slice_options,
+        ),
+        use_container_width=True,
+        config=slice_plot_config,
+    )
+
+with sagittal_tab:
+    slice_x = st.slider(
+        "Sagittal slice (x)",
+        0,
+        result["image_np"].shape[2] - 1,
+        result["image_np"].shape[2] // 2,
+        key="slice_x",
+    )
+    st.plotly_chart(
+        create_slice_figure(
+            result["image_np"],
+            result["mask_np"],
+            slice_x,
+            plane="sagittal",
+            **slice_options,
+        ),
+        use_container_width=True,
+        config=slice_plot_config,
+    )
