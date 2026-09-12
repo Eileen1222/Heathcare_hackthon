@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from src.io_utils import make_prediction, save_prediction
@@ -34,10 +35,22 @@ def nifti_stem(path: Path) -> str:
 
 def main() -> None:
     args = build_parser().parse_args()
-    result = process_case(args.image, args.aorta_mask)
-    prediction = make_prediction(args.case_id or nifti_stem(args.image), result["branches"])
-    save_prediction(prediction, args.output)
-    print(f"Wrote {len(result['branches'])} branches to {args.output}")
+    try:
+        result = process_case(args.image, args.aorta_mask)
+        prediction = make_prediction(
+            args.case_id or nifti_stem(args.image), result["branches"]
+        )
+        save_prediction(prediction, args.output)
+        print(f"Wrote {len(result['branches'])} branches to {args.output}")
+    except FileNotFoundError as exc:
+        sys.stderr.write(f"Error (File Not Found): {exc}\n")
+        sys.exit(2)
+    except ValueError as exc:
+        sys.stderr.write(f"Error (Validation Failed): {exc}\n")
+        sys.exit(3)
+    except Exception as exc:
+        sys.stderr.write(f"Error (Unexpected Failure): {exc}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -189,9 +189,28 @@ st.success(f'Detected {len(result["branches"])} candidate branches')
 
 viewer_col, details_col = st.columns([2, 1])
 with viewer_col:
-    st.subheader("Interactive 3D aorta")
+    st.subheader("Interactive 3D aorta & branch vessels")
+    c3d_1, c3d_2, c3d_3 = st.columns(3)
+    with c3d_1:
+        show_vessel_tubes = st.checkbox(
+            "Vessel tubes (0-10 mm)", value=True, key="c3d_tubes"
+        )
+    with c3d_2:
+        show_centerlines_3d = st.checkbox(
+            "3D Centerlines", value=True, key="c3d_centerlines"
+        )
+    with c3d_3:
+        show_cones_3d = st.checkbox(
+            "Direction cones", value=False, key="c3d_cones"
+        )
+
     aorta_figure = create_aorta_figure(
-        result["mask_np"], result["mask_image"], result["branches"]
+        result["mask_np"],
+        result["mask_image"],
+        result["branches"],
+        show_vessels=show_vessel_tubes,
+        show_centerlines=show_centerlines_3d,
+        show_cones=show_cones_3d,
     )
     aorta_figure.update_layout(height=600)
     st.plotly_chart(

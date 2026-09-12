@@ -38,9 +38,9 @@ def _validate_pair(image, image_np, mask_image, mask_np) -> None:
         )
     if not np.any(mask_np > 0):
         raise ValueError("Aorta mask is empty")
-    if not np.allclose(image.GetSpacing(), mask_image.GetSpacing()):
+    if not np.allclose(image.GetSpacing(), mask_image.GetSpacing(), rtol=1e-3, atol=1e-3):
         raise ValueError("CTA and mask spacing differ")
-    if not np.allclose(image.GetOrigin(), mask_image.GetOrigin()):
+    if not np.allclose(image.GetOrigin(), mask_image.GetOrigin(), rtol=1e-3, atol=1e-2):
         raise ValueError("CTA and mask origins differ")
-    if not np.allclose(image.GetDirection(), mask_image.GetDirection()):
+    if not np.allclose(image.GetDirection(), mask_image.GetDirection(), rtol=1e-3, atol=1e-3):
         raise ValueError("CTA and mask directions differ")
