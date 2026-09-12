@@ -431,6 +431,50 @@ def _build_tube_mesh(
     )
 
 
+def prepare_aorta_3d_geometry(
+    mask_np: np.ndarray,
+    mask_image: sitk.Image,
+    branches: Iterable[dict[str, Any]] = (),
+) -> dict[str, Any]:
+    """Precompute immutable mesh geometry for responsive 3D interactions."""
+    binary = np.asarray(mask_np) > 0
+    if not np.any(binary):
+        raise ValueError("Cannot visualize an empty aorta mask")
+
+    vertices_zyx, faces, _, _ = marching_cubes(
+        binary.astype(np.uint8), level=0.5
+    )
+    vertices_xyz_mm = _indices_to_physical(vertices_zyx, mask_image)
+
+    bounds = []
+    for axis in range(3):
+        other_axes = tuple(index for index in range(3) if index != axis)
+        occupied = np.flatnonzero(binary.any(axis=other_axes))
+        bounds.append((int(occupied[0]), int(occupied[-1])))
+
+    branch_meshes = {}
+    for index, branch in enumerate(branches):
+        branch_id = str(branch.get("instance_id", f"branch_{index + 1:03d}"))
+        ostium = np.asarray(branch.get("ostium_xyz_mm", (0, 0, 0)), dtype=float)
+        seed = np.asarray(branch.get("seed_xyz_mm", (0, 0, 0)), dtype=float)
+        raw_path = branch.get("centreline_xyz_mm")
+        if raw_path and len(raw_path) >= 2:
+            path_pts = np.asarray(raw_path, dtype=float)
+        else:
+            path_pts = np.linspace(ostium, seed, 6)
+        branch_meshes[branch_id] = _build_tube_mesh(
+            path_pts, radius=float(branch.get("radius_mm", 1.0))
+        )
+
+    return {
+        "shape_zyx": tuple(binary.shape),
+        "bounds_zyx": tuple(bounds),
+        "aorta_vertices_xyz_mm": vertices_xyz_mm,
+        "aorta_faces": faces,
+        "branch_meshes": branch_meshes,
+    }
+
+
 def create_aorta_figure(
     mask_np: np.ndarray,
     mask_image: sitk.Image,
@@ -442,15 +486,16 @@ def create_aorta_figure(
     show_cones: bool = False,
     focused_branch_id: str | None = None,
     slice_plane_info: tuple[str, int] | None = None,
+    prepared_geometry: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> go.Figure:
     """Create an interactive 3D aorta mesh with realistic 3D vessel branch tubes."""
-    binary = np.asarray(mask_np) > 0
-    if not np.any(binary):
-        raise ValueError("Cannot visualize an empty aorta mask")
-
-    vertices_zyx, faces, _, _ = marching_cubes(binary.astype(np.uint8), level=0.5)
-    vertices_xyz_mm = _indices_to_physical(vertices_zyx, mask_image)
+    branches = list(branches)
+    geometry = prepared_geometry or prepare_aorta_3d_geometry(
+        mask_np, mask_image, branches
+    )
+    vertices_xyz_mm = geometry["aorta_vertices_xyz_mm"]
+    faces = geometry["aorta_faces"]
     figure = go.Figure(
         go.Mesh3d(
             x=vertices_xyz_mm[:, 0],
@@ -498,7 +543,7 @@ def create_aorta_figure(
 
         # 1. Realistic 3D vessel tubular mesh
         if show_vessels:
-            mesh_data = _build_tube_mesh(path_pts, radius=radius)
+            mesh_data = geometry["branch_meshes"].get(branch_id)
             if mesh_data is not None:
                 verts, I, J, K = mesh_data
                 figure.add_trace(
@@ -615,20 +660,15 @@ def create_aorta_figure(
     if slice_plane_info is not None:
         plane_type, slice_index = slice_plane_info
         plane_type = plane_type.lower()
-        shape_z, shape_y, shape_x = binary.shape
-        z_idx, y_idx, x_idx = np.where(binary)
-        if len(z_idx) > 0:
-            pad = 18
-            z_min = max(0, int(np.min(z_idx)) - pad)
-            z_max = min(shape_z - 1, int(np.max(z_idx)) + pad)
-            y_min = max(0, int(np.min(y_idx)) - pad)
-            y_max = min(shape_y - 1, int(np.max(y_idx)) + pad)
-            x_min = max(0, int(np.min(x_idx)) - pad)
-            x_max = min(shape_x - 1, int(np.max(x_idx)) + pad)
-        else:
-            z_min, z_max = 0, shape_z - 1
-            y_min, y_max = 0, shape_y - 1
-            x_min, x_max = 0, shape_x - 1
+        shape_z, shape_y, shape_x = geometry["shape_zyx"]
+        (z_bound, y_bound, x_bound) = geometry["bounds_zyx"]
+        pad = 18
+        z_min = max(0, z_bound[0] - pad)
+        z_max = min(shape_z - 1, z_bound[1] + pad)
+        y_min = max(0, y_bound[0] - pad)
+        y_max = min(shape_y - 1, y_bound[1] + pad)
+        x_min = max(0, x_bound[0] - pad)
+        x_max = min(shape_x - 1, x_bound[1] + pad)
 
         corners_zyx = None
         plane_color = "#00f0ff"

@@ -13,7 +13,11 @@ import streamlit.components.v1 as components
 
 from src.io_utils import make_prediction
 from src.pipeline import process_case
-from src.visualization import create_aorta_figure, create_slice_figure
+from src.visualization import (
+    create_aorta_figure,
+    create_slice_figure,
+    prepare_aorta_3d_geometry,
+)
 
 
 st.set_page_config(page_title="BranchSeed", page_icon="🫀", layout="wide")
@@ -135,6 +139,10 @@ if "input_signature" not in st.session_state:
     st.session_state.input_signature = None
 if "active_case_id" not in st.session_state:
     st.session_state.active_case_id = "uploaded_case"
+if "prediction" not in st.session_state:
+    st.session_state.prediction = None
+if "prepared_3d_geometry" not in st.session_state:
+    st.session_state.prepared_3d_geometry = None
 
 with st.sidebar:
     st.header("Case input")
@@ -158,6 +166,8 @@ if ct_upload is not None and mask_upload is not None:
 # Never display results generated from a different pair of uploaded volumes.
 if current_signature != st.session_state.input_signature:
     st.session_state.result = None
+    st.session_state.prediction = None
+    st.session_state.prepared_3d_geometry = None
     st.session_state.input_signature = current_signature
     for state_key in (
         "slice_z",
@@ -183,6 +193,17 @@ if run_clicked:
         try:
             with st.spinner("Processing 3D volumes..."):
                 st.session_state.result = process_case(ct_path, mask_path)
+                st.session_state.prediction = make_prediction(
+                    st.session_state.active_case_id,
+                    st.session_state.result["branches"],
+                )
+                st.session_state.prepared_3d_geometry = (
+                    prepare_aorta_3d_geometry(
+                        st.session_state.result["mask_np"],
+                        st.session_state.result["mask_image"],
+                        st.session_state.result["branches"],
+                    )
+                )
         except Exception as exc:  # Streamlit should show actionable input errors.
             st.error(f"Processing failed: {exc}")
             st.stop()
@@ -192,7 +213,15 @@ if st.session_state.result is None:
     st.stop()
 
 result = st.session_state.result
-prediction = make_prediction(st.session_state.active_case_id, result["branches"])
+if st.session_state.prediction is None:
+    st.session_state.prediction = make_prediction(
+        st.session_state.active_case_id, result["branches"]
+    )
+if st.session_state.prepared_3d_geometry is None:
+    st.session_state.prepared_3d_geometry = prepare_aorta_3d_geometry(
+        result["mask_np"], result["mask_image"], result["branches"]
+    )
+prediction = st.session_state.prediction
 st.success(f'Detected {len(result["branches"])} candidate branches')
 
 viewer_col, details_col = st.columns([2, 1])
@@ -248,6 +277,7 @@ with viewer_col:
         show_cones=False,
         focused_branch_id=st.session_state.focused_branch_id,
         slice_plane_info=slice_plane_info,
+        prepared_geometry=st.session_state.prepared_3d_geometry,
     )
     aorta_figure.update_layout(height=580)
     st.plotly_chart(
@@ -275,61 +305,102 @@ branch_list = result["branches"]
 branch_ids = [str(b["instance_id"]) for b in branch_list]
 select_options = ["None (Overview)"] + branch_ids
 
+
+def select_branch() -> None:
+    """Update focus and linked slices before Streamlit's single rerun."""
+    selected = st.session_state.branch_selector_widget
+    if selected == "None (Overview)":
+        st.session_state.focused_branch_id = None
+        return
+    st.session_state.focused_branch_id = selected
+    branch = next(
+        (item for item in branch_list if str(item["instance_id"]) == selected),
+        None,
+    )
+    if branch and branch.get("ostium_zyx"):
+        oz, oy, ox = [int(round(value)) for value in branch["ostium_zyx"]]
+        st.session_state.slice_z = oz
+        st.session_state.slice_y = oy
+        st.session_state.slice_x = ox
+
+
+def jump_to_branch(coordinate_key: str) -> None:
+    """Move all linked 2D/3D planes before the normal widget rerun."""
+    branch = next(
+        (
+            item
+            for item in branch_list
+            if str(item["instance_id"]) == st.session_state.focused_branch_id
+        ),
+        None,
+    )
+    if branch is None:
+        return
+    z, y, x = [int(round(value)) for value in branch[coordinate_key]]
+    st.session_state.slice_z = z
+    st.session_state.slice_y = y
+    st.session_state.slice_x = x
+
+
+def reset_branch_focus() -> None:
+    st.session_state.focused_branch_id = None
+    st.session_state.branch_selector_widget = "None (Overview)"
+
+
 current_sel_idx = 0
 if st.session_state.focused_branch_id in branch_ids:
     current_sel_idx = branch_ids.index(st.session_state.focused_branch_id) + 1
 
+focused_branch = next(
+    (
+        branch
+        for branch in branch_list
+        if str(branch["instance_id"]) == st.session_state.focused_branch_id
+    ),
+    None,
+)
+
 sync_c1, sync_c2, sync_c3, sync_c4 = st.columns([3, 2, 2, 2])
 with sync_c1:
-    selected_option = st.selectbox(
+    st.selectbox(
         "Select branch to inspect & cross-verify:",
         options=select_options,
         index=current_sel_idx,
         key="branch_selector_widget",
+        on_change=select_branch,
     )
-    if selected_option == "None (Overview)" and st.session_state.focused_branch_id is not None:
-        st.session_state.focused_branch_id = None
-        st.rerun()
-    elif selected_option != "None (Overview)" and selected_option != st.session_state.focused_branch_id:
-        st.session_state.focused_branch_id = selected_option
-        focused_b = next((b for b in branch_list if str(b["instance_id"]) == selected_option), None)
-        if focused_b and focused_b.get("ostium_zyx"):
-            st.session_state.slice_z = int(round(focused_b["ostium_zyx"][0]))
-            st.session_state.slice_y = int(round(focused_b["ostium_zyx"][1]))
-            st.session_state.slice_x = int(round(focused_b["ostium_zyx"][2]))
-        st.rerun()
-
-focused_branch = next(
-    (b for b in branch_list if str(b["instance_id"]) == st.session_state.focused_branch_id),
-    None,
-)
 
 with sync_c2:
     st.write("")
     st.write("")
-    if focused_branch and st.button("🎯 Jump 2D to Ostium", use_container_width=True):
-        oz, oy, ox = [int(round(v)) for v in focused_branch["ostium_zyx"]]
-        st.session_state.slice_z = oz
-        st.session_state.slice_y = oy
-        st.session_state.slice_x = ox
-        st.rerun()
+    st.button(
+        "🎯 Jump 2D to Ostium",
+        use_container_width=True,
+        disabled=focused_branch is None,
+        on_click=jump_to_branch,
+        args=("ostium_zyx",),
+    )
 
 with sync_c3:
     st.write("")
     st.write("")
-    if focused_branch and st.button("📍 Jump 2D to 5mm Seed", use_container_width=True):
-        sz, sy, sx = [int(round(v)) for v in focused_branch["seed_zyx"]]
-        st.session_state.slice_z = sz
-        st.session_state.slice_y = sy
-        st.session_state.slice_x = sx
-        st.rerun()
+    st.button(
+        "📍 Jump 2D to 5mm Seed",
+        use_container_width=True,
+        disabled=focused_branch is None,
+        on_click=jump_to_branch,
+        args=("seed_zyx",),
+    )
 
 with sync_c4:
     st.write("")
     st.write("")
-    if focused_branch and st.button("✖ Reset Focus", use_container_width=True):
-        st.session_state.focused_branch_id = None
-        st.rerun()
+    st.button(
+        "✖ Reset Focus",
+        use_container_width=True,
+        disabled=focused_branch is None,
+        on_click=reset_branch_focus,
+    )
 
 if focused_branch:
     oz, oy, ox = [int(round(v)) for v in focused_branch["ostium_zyx"]]
