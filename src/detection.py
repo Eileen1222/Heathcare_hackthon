@@ -26,6 +26,7 @@ from skimage.morphology import skeletonize
 
 from src.geometry import unit_direction_xyz
 from src.io_utils import zyx_to_physical_xyz
+from src.preprocess import CroppedDistanceField
 
 
 @dataclass(frozen=True)
@@ -401,6 +402,7 @@ def detect_branches(
     search_shell: np.ndarray,
     *,
     config: DetectionConfig | None = None,
+    distance_field: CroppedDistanceField | None = None,
 ) -> list[dict[str, Any]]:
     """Return independently wall-connected, contrast-filled tubular candidates.
 
@@ -456,7 +458,14 @@ def detect_branches(
     low, high = _intensity_limits(ct, aorta, spacing, config)
     enhanced = np.isfinite(ct) & (ct >= low) & (ct <= high)
     # Retain a small full-lumen halo for skeleton endpoint and radius estimation.
-    distance_to_aorta = ndi.distance_transform_edt(~aorta, sampling=spacing)
+    if distance_field is None:
+        distance_to_aorta = ndi.distance_transform_edt(~aorta, sampling=spacing)
+    else:
+        if distance_field.volume_shape != tuple(image_np.shape):
+            raise ValueError("Cached distance field shape differs from CT")
+        if not np.allclose(distance_field.spacing_zyx, spacing):
+            raise ValueError("Cached distance field spacing differs from CT")
+        distance_to_aorta = distance_field.extract(roi)
     max_search_distance = float(distance_to_aorta[shell].max())
     candidate = enhanced & ~aorta & (distance_to_aorta <= max_search_distance + 5.0)
     face_structure = ndi.generate_binary_structure(3, 1)

@@ -9,7 +9,7 @@ import numpy as np
 
 from src.detection import detect_branches
 from src.io_utils import load_image
-from src.preprocess import make_aorta_shell
+from src.preprocess import make_aorta_search
 
 
 def process_case(image_path: str | Path, mask_path: str | Path) -> dict[str, Any]:
@@ -18,8 +18,14 @@ def process_case(image_path: str | Path, mask_path: str | Path) -> dict[str, Any
     _validate_pair(image, image_np, mask_image, mask_np)
 
     mask_np = mask_np > 0
-    search_shell = make_aorta_shell(mask_np, image.GetSpacing())
-    branches = detect_branches(image, image_np, mask_np, search_shell)
+    search_shell, distance_field = make_aorta_search(mask_np, image.GetSpacing())
+    branches = detect_branches(
+        image,
+        image_np,
+        mask_np,
+        search_shell,
+        distance_field=distance_field,
+    )
 
     return {
         "image": image,
