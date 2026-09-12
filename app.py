@@ -231,99 +231,74 @@ with details_col:
         use_container_width=True,
     )
 
-st.subheader("CT / detection overlay")
-slice_plot_config = {
-    "scrollZoom": True,
-    "displaylogo": False,
-}
-spacing_zyx = result["image"].GetSpacing()[::-1]
-slice_view_col, layer_controls_col = st.columns([5, 1], gap="medium")
+@st.fragment
+def render_ct_viewer(case_result: dict[str, Any]) -> None:
+    """Rerun only the active 2D viewer when its controls change."""
+    st.subheader("CT / detection overlay")
+    slice_plot_config = {
+        "scrollZoom": True,
+        "displaylogo": False,
+    }
+    spacing_zyx = case_result["image"].GetSpacing()[::-1]
+    slice_view_col, layer_controls_col = st.columns([5, 1], gap="medium")
 
-with layer_controls_col:
-    st.markdown("#### Layers")
-    show_mask = st.checkbox("🟧 Aorta mask", value=True)
-    show_ostia = st.checkbox("🟡 Ostia", value=True)
-    show_seeds = st.checkbox("◆ 5 mm seeds", value=True)
-    show_directions = st.checkbox("➜ Directions", value=True)
-    show_centerlines = st.checkbox("┈ Centerlines", value=True)
-    show_radius = st.checkbox("◯ Seed radius", value=True)
-    st.caption(
-        "Each branch has one saturated color. Its centerline uses a lighter "
-        "dotted shade of the same color. An × marks a seed projected from a "
-        "nearby slice."
-    )
+    with layer_controls_col:
+        st.markdown("#### Layers")
+        show_mask = st.checkbox("🟧 Aorta mask", value=True)
+        show_ostia = st.checkbox("🟡 Ostia", value=True)
+        show_seeds = st.checkbox("◆ 5 mm seeds", value=True)
+        show_directions = st.checkbox("➜ Directions", value=True)
+        show_centerlines = st.checkbox("┈ Centerlines", value=True)
+        show_radius = st.checkbox("◯ Seed radius", value=True)
+        st.caption(
+            "Each branch has one saturated color. Its centerline uses a lighter "
+            "dotted shade of the same color. An × marks a seed projected from a "
+            "nearby slice."
+        )
 
-slice_options = {
-    "branches": result["branches"],
-    "spacing_zyx": spacing_zyx,
-    "show_mask": show_mask,
-    "show_ostia": show_ostia,
-    "show_seeds": show_seeds,
-    "show_directions": show_directions,
-    "show_centerlines": show_centerlines,
-    "show_radius": show_radius,
-}
+    plane_specs = {
+        "Axial (Z)": ("axial", 0, "z", "slice_z"),
+        "Coronal (Y)": ("coronal", 1, "y", "slice_y"),
+        "Sagittal (X)": ("sagittal", 2, "x", "slice_x"),
+    }
+    slice_options = {
+        "branches": case_result["branches"],
+        "spacing_zyx": spacing_zyx,
+        "show_mask": show_mask,
+        "show_ostia": show_ostia,
+        "show_seeds": show_seeds,
+        "show_directions": show_directions,
+        "show_centerlines": show_centerlines,
+        "show_radius": show_radius,
+    }
 
-with slice_view_col:
-    axial_tab, coronal_tab, sagittal_tab = st.tabs(
-        ["Axial (Z)", "Coronal (Y)", "Sagittal (X)"]
-    )
-    with axial_tab:
-        slice_z = st.slider(
-            "Axial slice (z)",
+    with slice_view_col:
+        selected_view = st.radio(
+            "Viewing plane",
+            list(plane_specs),
+            horizontal=True,
+            label_visibility="collapsed",
+            key="slice_plane",
+        )
+        plane, axis, axis_name, slider_key = plane_specs[selected_view]
+        slice_index = st.slider(
+            f"{selected_view} slice ({axis_name})",
             0,
-            result["image_np"].shape[0] - 1,
-            result["image_np"].shape[0] // 2,
-            key="slice_z",
+            case_result["image_np"].shape[axis] - 1,
+            case_result["image_np"].shape[axis] // 2,
+            key=slider_key,
         )
         st.plotly_chart(
             create_slice_figure(
-                result["image_np"],
-                result["mask_np"],
-                slice_z,
-                plane="axial",
+                case_result["image_np"],
+                case_result["mask_np"],
+                slice_index,
+                plane=plane,
                 **slice_options,
             ),
             use_container_width=True,
             config=slice_plot_config,
         )
 
-    with coronal_tab:
-        slice_y = st.slider(
-            "Coronal slice (y)",
-            0,
-            result["image_np"].shape[1] - 1,
-            result["image_np"].shape[1] // 2,
-            key="slice_y",
-        )
-        st.plotly_chart(
-            create_slice_figure(
-                result["image_np"],
-                result["mask_np"],
-                slice_y,
-                plane="coronal",
-                **slice_options,
-            ),
-            use_container_width=True,
-            config=slice_plot_config,
-        )
 
-    with sagittal_tab:
-        slice_x = st.slider(
-            "Sagittal slice (x)",
-            0,
-            result["image_np"].shape[2] - 1,
-            result["image_np"].shape[2] // 2,
-            key="slice_x",
-        )
-        st.plotly_chart(
-            create_slice_figure(
-                result["image_np"],
-                result["mask_np"],
-                slice_x,
-                plane="sagittal",
-                **slice_options,
-            ),
-            use_container_width=True,
-            config=slice_plot_config,
-        )
+render_ct_viewer(result)
