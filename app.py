@@ -129,80 +129,158 @@ def render_prediction_viewer(prediction_text: str) -> None:
     components.html(viewer_html, height=515, scrolling=False)
 
 
+@st.cache_resource(show_spinner=False)
+def get_cached_case_result(ct_path_str: str, mask_path_str: str) -> dict[str, Any]:
+    return process_case(ct_path_str, mask_path_str)
+
+
 if "result" not in st.session_state:
     st.session_state.result = None
 if "input_signature" not in st.session_state:
     st.session_state.input_signature = None
+if "active_case_id" not in st.session_state:
+    st.session_state.active_case_id = "uploaded_case"
+
+# Discover available preloaded cases in data/
+available_cases: dict[str, tuple[Path, Path]] = {}
+data_dir = Path("data")
+if data_dir.is_dir():
+    for sub_dir in sorted(data_dir.iterdir()):
+        if sub_dir.is_dir():
+            cts = list(sub_dir.glob("orig*.nii*")) + list(sub_dir.glob("image*.nii*"))
+            masks = list(sub_dir.glob("mask*.nii*"))
+            if cts and masks:
+                available_cases[sub_dir.name] = (cts[0], masks[0])
 
 with st.sidebar:
     st.header("Case input")
-    case_id = st.text_input("Case ID", value="uploaded_case")
-    ct_upload = st.file_uploader("CTA volume", type=["nii", "gz"])
-    mask_upload = st.file_uploader("Aorta mask", type=["nii", "gz"])
-    run_clicked = st.button(
-        "Run detection",
-        type="primary",
-        use_container_width=True,
-        disabled=ct_upload is None or mask_upload is None,
-    )
+    mode_options = ["Preloaded Cases", "Upload NIfTI"] if available_cases else ["Upload NIfTI"]
+    input_mode = st.radio("Input Source", mode_options, horizontal=True)
+
+    ct_upload = None
+    mask_upload = None
+    selected_case = None
+
+    if input_mode == "Preloaded Cases":
+        selected_case = st.selectbox(
+            "Select Benchmark Case",
+            list(available_cases.keys()),
+            format_func=lambda x: f"{x} ({'26 branches' if x == 'subject003' else ('9 branches' if x == 'subject001' else '5 branches')})",
+        )
+        case_id = selected_case
+        run_clicked = st.button("Load / Run Case", type="primary", use_container_width=True)
+    else:
+        case_id = st.text_input("Case ID", value="uploaded_case")
+        ct_upload = st.file_uploader("CTA volume", type=["nii", "gz"])
+        mask_upload = st.file_uploader("Aorta mask", type=["nii", "gz"])
+        run_clicked = st.button(
+            "Run detection",
+            type="primary",
+            use_container_width=True,
+            disabled=ct_upload is None or mask_upload is None,
+        )
 
 current_signature = None
-if ct_upload is not None and mask_upload is not None:
+if input_mode == "Preloaded Cases" and selected_case:
+    current_signature = ("preloaded", selected_case)
+elif ct_upload is not None and mask_upload is not None:
     current_signature = (
         upload_signature(ct_upload),
         upload_signature(mask_upload),
     )
 
-# Never display results generated from a different pair of uploaded volumes.
+# Never display results generated from a different pair of volumes.
 if current_signature != st.session_state.input_signature:
     st.session_state.result = None
     st.session_state.input_signature = current_signature
-    for slice_key in ("slice_z", "slice_y", "slice_x"):
-        st.session_state.pop(slice_key, None)
+    for state_key in (
+        "slice_z",
+        "slice_y",
+        "slice_x",
+        "focused_branch_id",
+        "branch_selector_widget",
+        "c3d_plane_type",
+    ):
+        st.session_state.pop(state_key, None)
 
 if run_clicked:
-    # Clear the previous result before processing so a failed rerun cannot show
-    # stale data for the current input pair.
     st.session_state.result = None
+    st.session_state.active_case_id = case_id
 
-    with tempfile.TemporaryDirectory(prefix="branchseed-") as temp_dir:
-        temp_path = Path(temp_dir)
-        ct_path = temp_path / (ct_upload.name or "image.nii.gz")
-        mask_path = temp_path / (mask_upload.name or "mask.nii.gz")
-        ct_path.write_bytes(ct_upload.getvalue())
-        mask_path.write_bytes(mask_upload.getvalue())
-
+    if input_mode == "Preloaded Cases" and selected_case:
+        ct_path, mask_path = available_cases[selected_case]
         try:
-            with st.spinner("Processing 3D volumes..."):
-                st.session_state.result = process_case(ct_path, mask_path)
-        except Exception as exc:  # Streamlit should show actionable input errors.
+            with st.spinner(f"Processing 3D volumes for {selected_case}..."):
+                st.session_state.result = get_cached_case_result(str(ct_path), str(mask_path))
+        except Exception as exc:
             st.error(f"Processing failed: {exc}")
             st.stop()
+    else:
+        with tempfile.TemporaryDirectory(prefix="branchseed-") as temp_dir:
+            temp_path = Path(temp_dir)
+            ct_path = temp_path / (ct_upload.name or "image.nii.gz")
+            mask_path = temp_path / (mask_upload.name or "mask.nii.gz")
+            ct_path.write_bytes(ct_upload.getvalue())
+            mask_path.write_bytes(mask_upload.getvalue())
+
+            try:
+                with st.spinner("Processing 3D volumes..."):
+                    st.session_state.result = process_case(ct_path, mask_path)
+            except Exception as exc:  # Streamlit should show actionable input errors.
+                st.error(f"Processing failed: {exc}")
+                st.stop()
 
 if st.session_state.result is None:
-    st.info("Upload a CTA volume and matching aorta mask to begin.")
+    st.info("Select a preloaded case or upload a CTA volume and matching aorta mask to begin.")
     st.stop()
 
 result = st.session_state.result
-prediction = make_prediction(case_id, result["branches"])
+prediction = make_prediction(st.session_state.active_case_id, result["branches"])
 st.success(f'Detected {len(result["branches"])} candidate branches')
 
 viewer_col, details_col = st.columns([2, 1])
+
+# Initialize interactive linkage session states
+if "slice_z" not in st.session_state:
+    st.session_state.slice_z = result["image_np"].shape[0] // 2
+if "slice_y" not in st.session_state:
+    st.session_state.slice_y = result["image_np"].shape[1] // 2
+if "slice_x" not in st.session_state:
+    st.session_state.slice_x = result["image_np"].shape[2] // 2
+if "focused_branch_id" not in st.session_state:
+    st.session_state.focused_branch_id = None
+
 with viewer_col:
     st.subheader("Interactive 3D aorta & branch vessels")
-    c3d_1, c3d_2, c3d_3 = st.columns(3)
+    c3d_1, c3d_2, c3d_3, c3d_4 = st.columns([1, 1, 1, 1])
     with c3d_1:
         show_vessel_tubes = st.checkbox(
-            "Vessel tubes (0-10 mm)", value=True, key="c3d_tubes"
+            "Vessel tubes", value=True, key="c3d_tubes"
         )
     with c3d_2:
         show_centerlines_3d = st.checkbox(
-            "3D Centerlines", value=True, key="c3d_centerlines"
+            "Centerlines", value=True, key="c3d_centerlines"
         )
     with c3d_3:
-        show_cones_3d = st.checkbox(
-            "Direction cones", value=False, key="c3d_cones"
+        show_slice_plane_3d = st.checkbox(
+            "2D Slice plane", value=True, key="c3d_plane"
         )
+    with c3d_4:
+        c3d_plane_type = st.selectbox(
+            "Plane",
+            ["Axial (Z)", "Coronal (Y)", "Sagittal (X)"],
+            key="c3d_plane_type",
+            label_visibility="collapsed",
+        )
+
+    slice_plane_info = None
+    if show_slice_plane_3d:
+        if "Axial" in c3d_plane_type:
+            slice_plane_info = ("axial", int(st.session_state.slice_z))
+        elif "Coronal" in c3d_plane_type:
+            slice_plane_info = ("coronal", int(st.session_state.slice_y))
+        else:
+            slice_plane_info = ("sagittal", int(st.session_state.slice_x))
 
     aorta_figure = create_aorta_figure(
         result["mask_np"],
@@ -210,9 +288,11 @@ with viewer_col:
         result["branches"],
         show_vessels=show_vessel_tubes,
         show_centerlines=show_centerlines_3d,
-        show_cones=show_cones_3d,
+        show_cones=False,
+        focused_branch_id=st.session_state.focused_branch_id,
+        slice_plane_info=slice_plane_info,
     )
-    aorta_figure.update_layout(height=600)
+    aorta_figure.update_layout(height=580)
     st.plotly_chart(
         aorta_figure,
         use_container_width=True,
@@ -226,13 +306,108 @@ with details_col:
     st.download_button(
         "Download prediction.json",
         data=payload,
-        file_name=f"{case_id}.json",
+        file_name=f"{st.session_state.active_case_id}.json",
         mime="application/json",
         use_container_width=True,
     )
 
+# --- Clinical Synchronizer & Branch Inspector ---
+st.divider()
+st.subheader("🔍 Clinical Branch Inspector & 3D ↔ 2D Synchronizer")
+branch_list = result["branches"]
+branch_ids = [str(b["instance_id"]) for b in branch_list]
+select_options = ["None (Overview)"] + branch_ids
+
+current_sel_idx = 0
+if st.session_state.focused_branch_id in branch_ids:
+    current_sel_idx = branch_ids.index(st.session_state.focused_branch_id) + 1
+
+sync_c1, sync_c2, sync_c3, sync_c4 = st.columns([3, 2, 2, 2])
+with sync_c1:
+    selected_option = st.selectbox(
+        "Select branch to inspect & cross-verify:",
+        options=select_options,
+        index=current_sel_idx,
+        key="branch_selector_widget",
+    )
+    if selected_option == "None (Overview)" and st.session_state.focused_branch_id is not None:
+        st.session_state.focused_branch_id = None
+        st.rerun()
+    elif selected_option != "None (Overview)" and selected_option != st.session_state.focused_branch_id:
+        st.session_state.focused_branch_id = selected_option
+        focused_b = next((b for b in branch_list if str(b["instance_id"]) == selected_option), None)
+        if focused_b and focused_b.get("ostium_zyx"):
+            st.session_state.slice_z = int(round(focused_b["ostium_zyx"][0]))
+            st.session_state.slice_y = int(round(focused_b["ostium_zyx"][1]))
+            st.session_state.slice_x = int(round(focused_b["ostium_zyx"][2]))
+        st.rerun()
+
+focused_branch = next(
+    (b for b in branch_list if str(b["instance_id"]) == st.session_state.focused_branch_id),
+    None,
+)
+
+with sync_c2:
+    st.write("")
+    st.write("")
+    if focused_branch and st.button("🎯 Jump 2D to Ostium", use_container_width=True):
+        oz, oy, ox = [int(round(v)) for v in focused_branch["ostium_zyx"]]
+        st.session_state.slice_z = oz
+        st.session_state.slice_y = oy
+        st.session_state.slice_x = ox
+        st.rerun()
+
+with sync_c3:
+    st.write("")
+    st.write("")
+    if focused_branch and st.button("📍 Jump 2D to 5mm Seed", use_container_width=True):
+        sz, sy, sx = [int(round(v)) for v in focused_branch["seed_zyx"]]
+        st.session_state.slice_z = sz
+        st.session_state.slice_y = sy
+        st.session_state.slice_x = sx
+        st.rerun()
+
+with sync_c4:
+    st.write("")
+    st.write("")
+    if focused_branch and st.button("✖ Reset Focus", use_container_width=True):
+        st.session_state.focused_branch_id = None
+        st.rerun()
+
+if focused_branch:
+    oz, oy, ox = [int(round(v)) for v in focused_branch["ostium_zyx"]]
+    sz, sy, sx = [int(round(v)) for v in focused_branch["seed_zyx"]]
+    shape = result["image_np"].shape
+    oz_c = min(shape[0] - 1, max(0, oz))
+    oy_c = min(shape[1] - 1, max(0, oy))
+    ox_c = min(shape[2] - 1, max(0, ox))
+    sz_c = min(shape[0] - 1, max(0, sz))
+    sy_c = min(shape[1] - 1, max(0, sy))
+    sx_c = min(shape[2] - 1, max(0, sx))
+
+    ost_hu = int(result["image_np"][oz_c, oy_c, ox_c])
+    seed_hu = int(result["image_np"][sz_c, sy_c, sx_c])
+    radius = float(focused_branch["radius_mm"])
+    path_len = float(focused_branch.get("path_length_mm", 0.0))
+
+    card_c1, card_c2, card_c3, card_c4, card_c5 = st.columns(5)
+    card_c1.metric("Focused Branch", focused_branch["instance_id"])
+    card_c2.metric("Estimated Radius", f"{radius:.2f} mm", f"Dia: {radius * 2:.2f} mm")
+    card_c3.metric("Centerline Extent", f"{path_len:.1f} mm")
+    card_c4.metric(
+        "Ostium CT Density",
+        f"{ost_hu} HU",
+        "Contrast lumen" if ost_hu >= 200 else "Low contrast",
+    )
+    card_c5.metric(
+        "5mm Seed Density",
+        f"{seed_hu} HU",
+        "Lumen confirmed" if seed_hu >= 180 else "Tissue boundary",
+    )
+
+
 @st.fragment
-def render_ct_viewer(case_result: dict[str, Any]) -> None:
+def render_ct_viewer(case_result: dict[str, Any], focused_branch_id: str | None) -> None:
     """Rerun only the active 2D viewer when its controls change."""
     st.subheader("CT / detection overlay")
     slice_plot_config = {
@@ -251,9 +426,8 @@ def render_ct_viewer(case_result: dict[str, Any]) -> None:
         show_centerlines = st.checkbox("┈ Centerlines", value=True)
         show_radius = st.checkbox("◯ Seed radius", value=True)
         st.caption(
-            "Each branch has one saturated color. Its centerline uses a lighter "
-            "dotted shade of the same color. An × marks a seed projected from a "
-            "nearby slice."
+            "Each branch has one saturated color. Star (★) marks the currently "
+            "focused branch. An × marks a seed projected from a nearby slice."
         )
 
     plane_specs = {
@@ -270,7 +444,26 @@ def render_ct_viewer(case_result: dict[str, Any]) -> None:
         "show_directions": show_directions,
         "show_centerlines": show_centerlines,
         "show_radius": show_radius,
+        "focused_branch_id": focused_branch_id,
     }
+
+    def format_intersections(branches: list[dict], axis: int, slice_val: int, spacing: float) -> list[str]:
+        tol = max(1.0, 0.75 * spacing)
+        hits = []
+        for b in branches:
+            bid = str(b.get("instance_id", ""))
+            ost = b["ostium_zyx"][axis]
+            seed = b["seed_zyx"][axis]
+            d_ost = abs(ost - slice_val) * spacing
+            d_seed = abs(seed - slice_val) * spacing
+            parts = []
+            if d_ost <= tol:
+                parts.append(f"Ostium Δ{d_ost:.1f}mm")
+            if d_seed <= tol:
+                parts.append(f"5mm Seed Δ{d_seed:.1f}mm")
+            if parts:
+                hits.append(f"**{bid}** ({', '.join(parts)})")
+        return hits
 
     with slice_view_col:
         selected_view = st.radio(
@@ -285,9 +478,19 @@ def render_ct_viewer(case_result: dict[str, Any]) -> None:
             f"{selected_view} slice ({axis_name})",
             0,
             case_result["image_np"].shape[axis] - 1,
-            case_result["image_np"].shape[axis] // 2,
+            value=int(st.session_state.get(slider_key, case_result["image_np"].shape[axis] // 2)),
             key=slider_key,
         )
+
+        hits = format_intersections(
+            case_result["branches"],
+            axis,
+            int(slice_index),
+            spacing_zyx[axis],
+        )
+        if hits:
+            st.info(f"🎯 **Current {selected_view} slice ({axis_name}={slice_index}) intersects:** " + " · ".join(hits))
+
         st.plotly_chart(
             create_slice_figure(
                 case_result["image_np"],
@@ -301,4 +504,4 @@ def render_ct_viewer(case_result: dict[str, Any]) -> None:
         )
 
 
-render_ct_viewer(result)
+render_ct_viewer(result, st.session_state.focused_branch_id)

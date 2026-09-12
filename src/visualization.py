@@ -10,18 +10,18 @@ import SimpleITK as sitk
 from skimage.measure import marching_cubes
 
 BRANCH_COLORS: tuple[str, ...] = (
-    "#00d4ff",  # 电光青
-    "#7bed9f",  # 薄荷绿
-    "#ffd166",  # 琥珀黄
-    "#ff6b9d",  # 珊瑚粉
-    "#a78bfa",  # 丁香紫
-    "#ffa502",  # 暖橙
-    "#48dbfb",  # 冰天蓝
-    "#2ed573",  # 翡翠绿
-    "#ff4757",  # 活力红
-    "#1e90ff",  # 道奇蓝
-    "#eccc68",  # 暖金
-    "#f368e0",  # 桃红
+    "#00d4ff",  
+    "#7bed9f",  
+    "#ffd166",  
+    "#ff6b9d",  
+    "#a78bfa",  
+    "#ffa502",  
+    "#48dbfb",  
+    "#2ed573",  
+    "#ff4757",  
+    "#1e90ff",  
+    "#eccc68",  
+    "#f368e0",  
 )
 
 
@@ -39,6 +39,7 @@ def create_slice_figure(
     show_directions: bool = True,
     show_centerlines: bool = True,
     show_radius: bool = True,
+    focused_branch_id: str | None = None,
     **kwargs: Any,
 ) -> go.Figure:
     """Create an interactive CT slice with physically scaled detection overlays."""
@@ -107,19 +108,11 @@ def create_slice_figure(
         )
 
     tolerance_mm = max(1.0, 0.75 * spacing[fixed_axis])
-    # Each pair contains a saturated branch/direction color and a lighter
-    # same-family centerline color.
-    branch_palette = (
-        ("#00a8cc", "#7ee8fa"),
-        ("#2eae67", "#9cf2c0"),
-        ("#e2a400", "#ffe49a"),
-        ("#d94f87", "#ffadd0"),
-        ("#805ad5", "#c4b5fd"),
-        ("#008f72", "#7de2cb"),
-    )
     for branch_index, branch in enumerate(branches):
         branch_id = str(branch.get("instance_id", f"branch_{branch_index + 1:03d}"))
-        color, centerline_color = branch_palette[branch_index % len(branch_palette)]
+        color = BRANCH_COLORS[branch_index % len(BRANCH_COLORS)]
+        is_focused = focused_branch_id is not None and branch_id == focused_branch_id
+        is_dimmed = focused_branch_id is not None and not is_focused
 
         if show_centerlines and branch.get("centreline_zyx"):
             centreline = np.asarray(branch["centreline_zyx"], dtype=float)
@@ -143,17 +136,22 @@ def create_slice_figure(
                         x=line_x,
                         y=line_y,
                         mode="lines+markers",
-                        line={"color": centerline_color, "width": 3, "dash": "dot"},
-                        marker={"color": centerline_color, "size": 3},
+                        line={
+                            "color": color,
+                            "width": 5 if is_focused else (2 if is_dimmed else 3),
+                            "dash": "solid" if is_focused else "dot",
+                        },
+                        marker={
+                            "color": color,
+                            "size": 5 if is_focused else 3,
+                        },
+                        opacity=1.0 if is_focused else (0.45 if is_dimmed else 0.85),
                         name=f"{branch_id} centerline",
                         legendgroup=branch_id,
                         showlegend=False,
                         hovertemplate=f"{branch_id} centerline<extra></extra>",
                     )
                 )
-
-        if not (show_ostia or show_seeds or show_directions or show_radius):
-            continue
 
         ostium = np.asarray(branch["ostium_zyx"], dtype=float)
         seed = np.asarray(branch["seed_zyx"], dtype=float)
@@ -177,44 +175,46 @@ def create_slice_figure(
                     y=[ostium_y],
                     mode="markers+text",
                     marker={
-                        "size": 11,
-                        "color": "#ffe066",
-                        "line": {"color": color, "width": 2},
+                        "size": 15 if is_focused else 10,
+                        "color": "#ffe066" if is_focused else "#ffd166",
+                        "line": {
+                            "color": "#ffffff" if is_focused else color,
+                            "width": 3 if is_focused else 1.5,
+                        },
                     },
-                    text=[branch_id],
+                    text=[f"★ {branch_id}" if is_focused else branch_id],
                     textposition="top center",
-                    textfont={"color": color},
+                    textfont={"color": "#ffffff" if is_focused else color, "size": 12 if is_focused else 10},
                     name=branch_id,
                     legendgroup=branch_id,
                     showlegend=False,
+                    opacity=1.0 if is_focused else (0.4 if is_dimmed else 0.9),
                     hovertemplate=(
-                        f"{branch_id}<br>ostium"
-                        f"<br>z/y/x={ostium[0]:.1f}/{ostium[1]:.1f}/{ostium[2]:.1f}"
+                        f"<b>{branch_id}</b> (Ostium)"
+                        + (" [SELECTED]" if is_focused else "")
+                        + f"<br>z/y/x={ostium[0]:.1f}/{ostium[1]:.1f}/{ostium[2]:.1f}"
                         "<extra></extra>"
                     ),
                 )
             )
 
         if show_directions and ostium_near:
-            # The arrow is the projection of the 3D ostium-to-seed direction
-            # into the selected viewing plane.
-            figure.add_trace(
-                go.Scatter(
-                    x=[ostium_x, seed_x],
-                    y=[ostium_y, seed_y],
-                    mode="lines+markers",
-                    line={"color": color, "width": 3},
-                    marker={
-                        "color": color,
-                        "size": [0, 12],
-                        "symbol": ["circle", "arrow"],
-                        "angleref": "previous",
-                    },
-                    name=f"{branch_id} direction",
-                    legendgroup=branch_id,
-                    showlegend=False,
-                    hovertemplate=f"{branch_id} direction<extra></extra>",
-                )
+            figure.add_annotation(
+                x=seed_x,
+                y=seed_y,
+                ax=ostium_x,
+                ay=ostium_y,
+                xref="x",
+                yref="y",
+                axref="x",
+                ayref="y",
+                showarrow=True,
+                arrowhead=3,
+                arrowsize=1.4 if is_focused else 1.1,
+                arrowwidth=4 if is_focused else 2.5,
+                arrowcolor=color,
+                opacity=1.0 if is_focused else (0.35 if is_dimmed else 0.8),
+                text="",
             )
 
         if show_seeds and (seed_near or (show_directions and ostium_near)):
@@ -225,16 +225,19 @@ def create_slice_figure(
                     y=[seed_y],
                     mode="markers",
                     marker={
-                        "size": 9,
+                        "size": 12 if is_focused else 8,
                         "symbol": "x" if is_projection else "diamond",
                         "color": color,
+                        "line": {"color": "#ffffff", "width": 2 if is_focused else 0},
                     },
+                    opacity=1.0 if is_focused else (0.4 if is_dimmed else 0.9),
                     name=f"{branch_id} seed",
                     legendgroup=branch_id,
                     showlegend=False,
                     hovertemplate=(
-                        f"{branch_id}<br>"
+                        f"<b>{branch_id}</b><br>"
                         + ("seed projection" if is_projection else "5 mm seed")
+                        + (" [SELECTED]" if is_focused else "")
                         + f"<br>radius={float(branch['radius_mm']):.2f} mm"
                         + "<extra></extra>"
                     ),
@@ -249,18 +252,23 @@ def create_slice_figure(
                     x=seed_x + radius * np.cos(angles),
                     y=seed_y + radius * np.sin(angles),
                     mode="lines",
-                    line={"color": color, "width": 2, "dash": "dot"},
+                    line={
+                        "color": color,
+                        "width": 3.5 if is_focused else 2,
+                        "dash": "solid" if is_focused else "dot",
+                    },
+                    opacity=1.0 if is_focused else (0.35 if is_dimmed else 0.8),
                     name=f"{branch_id} radius",
                     legendgroup=branch_id,
                     showlegend=False,
                     hovertemplate=(
-                        f"{branch_id}<br>radius={radius:.2f} mm<extra></extra>"
+                        f"<b>{branch_id}</b> radius={radius:.2f} mm<extra></extra>"
                     ),
                 )
             )
 
     figure.update_layout(
-        height=580,
+        height=430,
         margin={"l": 10, "r": 10, "t": 45, "b": 10},
         title={
             "text": f"{plane.capitalize()} slice {axis_name}={slice_index}",
@@ -428,6 +436,8 @@ def create_aorta_figure(
     show_centerlines: bool = True,
     show_markers: bool = True,
     show_cones: bool = False,
+    focused_branch_id: str | None = None,
+    slice_plane_info: tuple[str, int] | None = None,
     **kwargs: Any,
 ) -> go.Figure:
     """Create an interactive 3D aorta mesh with realistic 3D vessel branch tubes."""
@@ -464,6 +474,14 @@ def create_aorta_figure(
         radius = float(branch.get("radius_mm", 1.0))
         path_len = float(branch.get("path_length_mm", 0.0))
 
+        is_focused = focused_branch_id is not None and branch_id == focused_branch_id
+        is_dimmed = focused_branch_id is not None and not is_focused
+
+        tube_opacity = 0.98 if is_focused else (0.16 if is_dimmed else 0.92)
+        centerline_w = 7 if is_focused else (2 if is_dimmed else 4)
+        ostium_s = 8 if is_focused else (3 if is_dimmed else 5)
+        seed_s = 9 if is_focused else (3 if is_dimmed else 6)
+
         ostium = np.asarray(branch.get("ostium_xyz_mm", (0, 0, 0)), dtype=float)
         seed = np.asarray(branch.get("seed_xyz_mm", (0, 0, 0)), dtype=float)
         direction = np.asarray(branch.get("direction_xyz", (0, 0, 1)), dtype=float)
@@ -487,23 +505,24 @@ def create_aorta_figure(
                         i=I,
                         j=J,
                         k=K,
-                        name=f"{branch_id} vessel",
+                        name=f"{branch_id} vessel" + (" ★" if is_focused else ""),
                         color=color,
-                        opacity=0.92,
+                        opacity=tube_opacity,
                         flatshading=False,
                         lighting={
-                            "ambient": 0.45,
-                            "diffuse": 0.85,
-                            "specular": 0.35,
-                            "roughness": 0.35,
+                            "ambient": 0.5 if is_focused else 0.45,
+                            "diffuse": 0.9 if is_focused else 0.85,
+                            "specular": 0.45 if is_focused else 0.35,
+                            "roughness": 0.25 if is_focused else 0.35,
                         },
                         legendgroup=branch_id,
                         showlegend=True,
                         hoverinfo="text",
                         hovertext=(
-                            f"<b>{branch_id}</b> (vessel)<br>"
-                            f"Radius: {radius:.2f} mm<br>"
-                            f"Trace extent: {path_len:.1f} mm"
+                            f"<b>{branch_id}</b>"
+                            + (" <b style='color:#ffd166'>[SELECTED]</b>" if is_focused else "")
+                            + f"<br>Radius: {radius:.2f} mm"
+                            + f"<br>Trace extent: {path_len:.1f} mm"
                         ),
                     )
                 )
@@ -516,7 +535,8 @@ def create_aorta_figure(
                     y=path_pts[:, 1],
                     z=path_pts[:, 2],
                     mode="lines",
-                    line={"color": color, "width": 4},
+                    line={"color": color, "width": centerline_w},
+                    opacity=1.0 if is_focused else (0.25 if is_dimmed else 1.0),
                     name=f"{branch_id} centerline",
                     legendgroup=branch_id,
                     showlegend=False,
@@ -532,7 +552,12 @@ def create_aorta_figure(
                     y=[ostium[1]],
                     z=[ostium[2]],
                     mode="markers",
-                    marker={"size": 5, "color": "#ffd166", "symbol": "circle"},
+                    marker={
+                        "size": ostium_s,
+                        "color": "#ffe066" if is_focused else "#ffd166",
+                        "symbol": "circle",
+                        "line": {"color": "#ffffff" if is_focused else color, "width": 2 if is_focused else 0},
+                    },
                     name=f"{branch_id} ostium",
                     legendgroup=branch_id,
                     showlegend=False,
@@ -546,7 +571,12 @@ def create_aorta_figure(
                     y=[seed[1]],
                     z=[seed[2]],
                     mode="markers",
-                    marker={"size": 6, "color": color, "symbol": "diamond"},
+                    marker={
+                        "size": seed_s,
+                        "color": color,
+                        "symbol": "diamond",
+                        "line": {"color": "#ffffff" if is_focused else color, "width": 2 if is_focused else 0},
+                    },
                     name=f"{branch_id} seed",
                     legendgroup=branch_id,
                     showlegend=False,
@@ -569,12 +599,95 @@ def create_aorta_figure(
                     v=[direction[1]],
                     w=[direction[2]],
                     sizemode="absolute",
-                    sizeref=5,
+                    sizeref=6 if is_focused else 4,
                     showscale=False,
                     colorscale=[[0, color], [1, color]],
                     name=f"{branch_id} cone",
                     legendgroup=branch_id,
                     showlegend=False,
+                )
+            )
+
+    if slice_plane_info is not None:
+        plane_type, slice_index = slice_plane_info
+        plane_type = plane_type.lower()
+        shape_z, shape_y, shape_x = binary.shape
+        z_idx, y_idx, x_idx = np.where(binary)
+        if len(z_idx) > 0:
+            pad = 18
+            z_min = max(0, int(np.min(z_idx)) - pad)
+            z_max = min(shape_z - 1, int(np.max(z_idx)) + pad)
+            y_min = max(0, int(np.min(y_idx)) - pad)
+            y_max = min(shape_y - 1, int(np.max(y_idx)) + pad)
+            x_min = max(0, int(np.min(x_idx)) - pad)
+            x_max = min(shape_x - 1, int(np.max(x_idx)) + pad)
+        else:
+            z_min, z_max = 0, shape_z - 1
+            y_min, y_max = 0, shape_y - 1
+            x_min, x_max = 0, shape_x - 1
+
+        corners_zyx = None
+        plane_color = "#00f0ff"
+        plane_name = f"{plane_type.capitalize()} plane"
+        if plane_type == "axial":
+            cur_z = max(0, min(shape_z - 1, int(slice_index)))
+            corners_zyx = np.array([
+                [cur_z, y_min, x_min],
+                [cur_z, y_min, x_max],
+                [cur_z, y_max, x_max],
+                [cur_z, y_max, x_min],
+            ], dtype=float)
+            plane_name = f"Axial plane (z={cur_z})"
+            plane_color = "#00f0ff"
+        elif plane_type == "coronal":
+            cur_y = max(0, min(shape_y - 1, int(slice_index)))
+            corners_zyx = np.array([
+                [z_min, cur_y, x_min],
+                [z_min, cur_y, x_max],
+                [z_max, cur_y, x_max],
+                [z_max, cur_y, x_min],
+            ], dtype=float)
+            plane_name = f"Coronal plane (y={cur_y})"
+            plane_color = "#2ed573"
+        elif plane_type == "sagittal":
+            cur_x = max(0, min(shape_x - 1, int(slice_index)))
+            corners_zyx = np.array([
+                [z_min, y_min, cur_x],
+                [z_max, y_min, cur_x],
+                [z_max, y_max, cur_x],
+                [z_min, y_max, cur_x],
+            ], dtype=float)
+            plane_name = f"Sagittal plane (x={cur_x})"
+            plane_color = "#ffa502"
+
+        if corners_zyx is not None:
+            corners_xyz = _indices_to_physical(corners_zyx, mask_image)
+            figure.add_trace(
+                go.Mesh3d(
+                    x=corners_xyz[:, 0],
+                    y=corners_xyz[:, 1],
+                    z=corners_xyz[:, 2],
+                    i=[0, 0],
+                    j=[1, 2],
+                    k=[2, 3],
+                    color=plane_color,
+                    opacity=0.22,
+                    name=plane_name,
+                    showlegend=True,
+                    hoverinfo="skip",
+                )
+            )
+            closed_perimeter = np.vstack([corners_xyz, corners_xyz[0]])
+            figure.add_trace(
+                go.Scatter3d(
+                    x=closed_perimeter[:, 0],
+                    y=closed_perimeter[:, 1],
+                    z=closed_perimeter[:, 2],
+                    mode="lines",
+                    line={"color": plane_color, "width": 4},
+                    name=f"{plane_name} outline",
+                    showlegend=False,
+                    hoverinfo="skip",
                 )
             )
 
