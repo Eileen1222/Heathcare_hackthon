@@ -1,15 +1,209 @@
-"""Direct-daughter detection seam.
+"""CPU baseline for direct aortic daughters; no anatomical-name inference.
 
-The stable return contract lets the detection teammate iterate independently.
-Each returned branch must include the fields documented in `geometry.py`.
+The four positional inputs and the geometry.py return contract are unchanged.
+Only this module owns segmentation/tracing. Extra centreline/quality fields are
+available to the viewer through result['branches']; make_prediction deliberately
+exports only the challenge fields. Distances are always physical millimetres.
+
+This is a heuristic prototype, not a validated detector. Touching enhanced veins,
+poor contrast, mask errors and thick slices can cause false/missed detections.
+The final dataset's minimum ostium size is not yet specified: configure it below
+when published, rather than inventing an anatomical list or a scoring threshold.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import heapq
+import warnings
+from itertools import product
 from typing import Any
 
 import numpy as np
 import SimpleITK as sitk
+from scipy import ndimage as ndi
+from skimage.morphology import skeletonize
+
+from src.geometry import unit_direction_xyz
+from src.io_utils import zyx_to_physical_xyz
+
+
+@dataclass(frozen=True)
+class DetectionConfig:
+    """Global settings, in mm/HU; never tuned to a named case.
+
+    min_ostium_radius_mm is an optional estimated equivalent opening radius,
+    NOT the seed radius. None means no unpublished challenge size cutoff.
+    spur_length_mm suppresses short skeleton artefacts when finding forks.
+    """
+
+    seed_distance_mm: float = 5.0
+    max_path_length_mm: float = 10.0
+    min_ostium_radius_mm: float | None = None
+    intensity_low_tolerance: float = 60.0
+    intensity_high_tolerance: float = 100.0
+    spur_length_mm: float = 1.5
+    max_cross_section_ratio: float = 2.5
+    max_seed_radius_mm: float = 8.0
+
+
+def _bbox(binary: np.ndarray, margin: np.ndarray) -> tuple[slice, ...]:
+    # Axis projections avoid an N-by-3 coordinate array for the full CT.
+    bounds = []
+    for axis in range(3):
+        occupied = np.flatnonzero(binary.any(axis=tuple(a for a in range(3) if a != axis)))
+        bounds.append(slice(max(0, int(occupied[0] - margin[axis])),
+                            min(binary.shape[axis], int(occupied[-1] + margin[axis] + 1))))
+    return tuple(bounds)
+
+
+def _intensity_limits(ct, aorta, spacing, config):
+    interior = ndi.distance_transform_edt(aorta, sampling=spacing) > min(spacing)
+    valid = interior & np.isfinite(ct)
+    if np.count_nonzero(valid) < 20:
+        valid = aorta & np.isfinite(ct)
+    values = ct[valid]
+    if not values.size:
+        raise ValueError("Aorta contains no finite CT intensities")
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median))) * 1.4826
+    # Per-slice medians compensate for contrast changes along the supplied mask.
+    profile = np.full(ct.shape[0], np.nan)
+    for z in range(ct.shape[0]):
+        samples = ct[z][valid[z]]
+        if samples.size >= 8:
+            profile[z] = np.median(samples)
+    known = np.flatnonzero(np.isfinite(profile))
+    if known.size:
+        profile = np.interp(np.arange(len(profile)), known, profile[known])
+    else:
+        profile[:] = median
+    low = profile - max(config.intensity_low_tolerance, 3 * mad)
+    high = profile + max(config.intensity_high_tolerance, 4 * mad)
+    return low[:, None, None], high[:, None, None]
+
+
+def _graph(points, spacing):
+    lookup = {tuple(p): i for i, p in enumerate(points)}
+    offsets = [np.array(o) for o in product((-1, 0, 1), repeat=3) if any(o)]
+    adjacency = [[] for _ in points]
+    for i, p in enumerate(points):
+        for offset in offsets:
+            j = lookup.get(tuple(p + offset))
+            if j is None or j <= i:
+                continue
+            # Remove redundant diagonal shortcuts across a right-angle corner.
+            # Without this, 26-neighbour voxel graphs contain false tiny forks.
+            axes = np.flatnonzero(offset)
+            redundant = False
+            if len(axes) > 1:
+                for axis in axes:
+                    step = np.zeros(3, dtype=int)
+                    step[axis] = offset[axis]
+                    if tuple(p + step) in lookup or tuple(p + offset - step) in lookup:
+                        redundant = True
+                        break
+            if not redundant:
+                length = float(np.linalg.norm(offset * spacing))
+                adjacency[i].append((j, length))
+                adjacency[j].append((i, length))
+    return adjacency
+
+
+def _skeleton_points(component, spacing):
+    points = np.argwhere(skeletonize(component, method="lee"))
+    if len(points) >= 2:
+        return points
+    # Lee thinning can erase an even-width, perfectly symmetric digital tube.
+    # In that degenerate case take one distance-ridge voxel per connected
+    # cross-section, with a deterministic central tie break. No tissue is added.
+    axis = int(np.argmax(np.asarray(component.shape) * spacing))
+    depth = ndi.distance_transform_edt(np.pad(component, 1), sampling=spacing)[1:-1, 1:-1, 1:-1]
+    recovered = []
+    for index in range(component.shape[axis]):
+        plane = np.take(component, index, axis=axis)
+        plane_depth = np.take(depth, index, axis=axis)
+        regions, count = ndi.label(plane)
+        for region in range(1, count + 1):
+            coordinates = np.argwhere(regions == region)
+            values = plane_depth[tuple(coordinates.T)]
+            peaks = coordinates[np.isclose(values, values.max())]
+            centre = coordinates.mean(axis=0)
+            chosen = peaks[np.argmin(np.sum((peaks - centre) ** 2, axis=1))]
+            recovered.append(np.insert(chosen, axis, index))
+    return np.asarray(recovered, dtype=int).reshape(-1, 3)
+
+
+def _rooted_tree(adjacency, root):
+    distance = np.full(len(adjacency), np.inf)
+    parent = np.full(len(adjacency), -1, dtype=int)
+    distance[root] = 0.0
+    queue = [(0.0, root)]
+    while queue:
+        cost, i = heapq.heappop(queue)
+        if cost > distance[i]:
+            continue
+        for j, length in adjacency[i]:
+            proposed = cost + length
+            if proposed < distance[j] - 1e-9:
+                distance[j], parent[j] = proposed, i
+                heapq.heappush(queue, (proposed, j))
+    children = [[] for _ in adjacency]
+    for j, i in enumerate(parent):
+        if i >= 0:
+            children[i].append(j)
+    reach = distance.copy()
+    for j in np.argsort(distance)[::-1]:
+        if parent[j] >= 0:
+            reach[parent[j]] = max(reach[parent[j]], reach[j])
+    return distance, children, reach
+
+
+def _sample(array, points, order=1):
+    return ndi.map_coordinates(array.astype(float, copy=False), np.asarray(points).T,
+                               order=order, mode="constant", cval=0, prefilter=False)
+
+
+def _resample_path(path, spacing, maximum):
+    cumulative = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0) * spacing, axis=1))]
+    keep = np.r_[True, np.diff(cumulative) > 1e-8]
+    path, cumulative = path[keep], cumulative[keep]
+    end = min(float(cumulative[-1]), maximum)
+    # Include original corners so the resampled polyline preserves arc length.
+    distances = np.unique(np.r_[np.arange(0, end, 0.25), cumulative[cumulative < end], end])
+    result = np.column_stack([np.interp(distances, cumulative, path[:, a]) for a in range(3)])
+    return result, distances
+
+
+def _cross_section(vessel, point, tangent, spacing, max_radius):
+    """Radial half-voxel boundary crossings in a plane normal to the path.
+
+    Unlike a 3D EDT at a truncated endpoint, these rays estimate the lumen
+    cross-section at the seed. Return None for an open/unbounded or flat sheet.
+    """
+    tangent = tangent / np.linalg.norm(tangent)
+    basis = np.eye(3)[np.argmin(np.abs(tangent))]
+    u = np.cross(tangent, basis)
+    u /= np.linalg.norm(u)
+    v = np.cross(tangent, u)
+    angles = np.arange(32) * (2 * np.pi / 32)
+    rays = np.cos(angles)[:, None] * u + np.sin(angles)[:, None] * v
+    step = min(0.2, float(min(spacing)) / 3)
+    lengths = np.arange(0, max_radius + step, step)
+    positions = point + rays[:, None, :] * lengths[None, :, None] / spacing
+    samples = _sample(vessel, positions.reshape(-1, 3)).reshape(32, -1)
+    outside = samples < 0.5
+    if np.any(~outside.any(axis=1)) or np.any(outside[:, 0]):
+        return None
+    first = outside.argmax(axis=1)
+    before = samples[np.arange(32), first - 1]
+    after = samples[np.arange(32), first]
+    radii = lengths[first - 1] + step * (before - 0.5) / np.maximum(before - after, 1e-8)
+    # Opposing chords are less sensitive to half-voxel skeleton offsets.
+    diameters = radii[:16] + radii[16:]
+    ratio = float(np.percentile(diameters, 90) / max(np.percentile(diameters, 10), 1e-8))
+    radius = float(np.sqrt(np.mean(radii ** 2)))
+    return radius, ratio
 
 
 def detect_branches(
@@ -17,12 +211,190 @@ def detect_branches(
     image_np: np.ndarray,
     mask_np: np.ndarray,
     search_shell: np.ndarray,
+    *,
+    config: DetectionConfig | None = None,
 ) -> list[dict[str, Any]]:
-    """Detect direct aortic daughters.
+    """Return independently wall-connected, contrast-filled tubular candidates.
 
-    Current scaffold returns no detections. Replace this body with the team's
-    threshold/component or vessel-enhancement algorithm while preserving the
-    return schema.
+    Required fields: instance_id, parent_instance_id, ostium_zyx, seed_zyx,
+    ostium_xyz_mm, seed_xyz_mm, radius_mm, direction_xyz.
+    Extra fields: centreline_zyx, centreline_xyz_mm, path_length_mm,
+    ostium_radius_mm, quality. The existing JSON writer ignores these extras.
+
+    The supplied shell limits centreline search; a CT halo preserves full lumen
+    cross-sections near its boundary. No gap-closing operation invents a direct
+    connection. A fork before 5 mm is conservatively omitted because the prompt
+    does not define which downstream limb should contain that trunk's seed.
     """
-    del image, image_np, mask_np, search_shell
-    return []
+    config = config or DetectionConfig()
+    if (not np.isfinite(config.seed_distance_mm) or config.seed_distance_mm <= 0
+            or not np.isfinite(config.max_path_length_mm)
+            or config.max_path_length_mm < config.seed_distance_mm):
+        raise ValueError("Require 0 < seed_distance_mm <= max_path_length_mm")
+    for value in (config.intensity_low_tolerance, config.intensity_high_tolerance,
+                  config.spur_length_mm, config.max_cross_section_ratio,
+                  config.max_seed_radius_mm):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError("Detection thresholds must be finite and positive")
+    if config.min_ostium_radius_mm is not None and (
+            not np.isfinite(config.min_ostium_radius_mm) or config.min_ostium_radius_mm < 0):
+        raise ValueError("min_ostium_radius_mm must be nonnegative or None")
+    if image.GetDimension() != 3 or image_np.ndim != 3:
+        raise ValueError("Expected a 3D CT")
+    if image_np.shape != mask_np.shape or image_np.shape != search_shell.shape:
+        raise ValueError("CT, mask and search_shell must have the same shape")
+    if tuple(image.GetSize()) != tuple(image_np.shape[::-1]):
+        raise ValueError("SimpleITK image size and CT array differ")
+    spacing = np.asarray(image.GetSpacing()[::-1], dtype=float)
+    if not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        raise ValueError("Image spacing must be finite and positive")
+    aorta_full = np.asarray(mask_np) > 0
+    if not aorta_full.any():
+        raise ValueError("Aorta mask is empty")
+    shell_full = np.asarray(search_shell, dtype=bool) & ~aorta_full
+    if not shell_full.any():
+        return []
+
+    roi = _bbox(aorta_full | shell_full, np.ceil(8.0 / spacing).astype(int))
+    origin = np.array([s.start for s in roi])
+    ct = np.asarray(image_np[roi], dtype=np.float32)
+    aorta, shell = aorta_full[roi], shell_full[roi]
+    low, high = _intensity_limits(ct, aorta, spacing, config)
+    enhanced = np.isfinite(ct) & (ct >= low) & (ct <= high)
+    # Retain a small full-lumen halo for skeleton endpoint and radius estimation.
+    distance_to_aorta = ndi.distance_transform_edt(~aorta, sampling=spacing)
+    max_search_distance = float(distance_to_aorta[shell].max())
+    candidate = enhanced & ~aorta & (distance_to_aorta <= max_search_distance + 5.0)
+    face_structure = ndi.generate_binary_structure(3, 1)
+    labels, _ = ndi.label(candidate, structure=face_structure)
+    contact = candidate & ndi.binary_dilation(aorta, structure=face_structure)
+
+    # Exclude artificial end faces along the mask's longest physical extent.
+    parent_box = _bbox(aorta, np.zeros(3, dtype=int))
+    axis = int(np.argmax([(s.stop - s.start) * spacing[i] for i, s in enumerate(parent_box)]))
+    axis_grid = np.arange(aorta.shape[axis])
+    end = (axis_grid <= parent_box[axis].start) | (axis_grid >= parent_box[axis].stop - 1)
+    reshape = [1, 1, 1]
+    reshape[axis] = len(axis_grid)
+    contact &= ~end.reshape(reshape)
+    component_ids = np.unique(labels[contact])
+    component_ids = component_ids[component_ids != 0]
+    objects = ndi.find_objects(labels)
+    results = []
+    early_forks = 0
+    for component_id in component_ids:
+        component_box = objects[component_id - 1]
+        # Tight padded per-component arrays keep skeletonization CPU/memory small.
+        box = tuple(slice(max(0, s.start - 1), min(ct.shape[a], s.stop + 1))
+                    for a, s in enumerate(component_box))
+        offset = np.array([s.start for s in box])
+        component = labels[box] == component_id
+        wall = contact[box] & component
+        openings, count = ndi.label(wall, structure=face_structure)
+        if not count:
+            continue
+        points = _skeleton_points(component, spacing)
+        if len(points) < 2:
+            continue
+        adjacency = _graph(points, spacing)
+        vessel = component.astype(np.float32)
+        parent = aorta[box]
+        # Used only for locating the actual mask/CT interface, not branch direction.
+        _, nearest_parent = ndi.distance_transform_edt(~parent, sampling=spacing, return_indices=True)
+        for opening_id in range(1, count + 1):
+            opening = np.argwhere(openings == opening_id)
+            nearest = nearest_parent[(slice(None), *opening.T)].T
+            interface = (opening + nearest) / 2.0
+            ostium = interface.mean(axis=0)
+            # Use projected wall patch area, accounting for anisotropic voxels.
+            normal = np.mean((opening - nearest) * spacing, axis=0)
+            if np.linalg.norm(normal) < 1e-8:
+                continue
+            normal /= np.linalg.norm(normal)
+            area = len(opening) * float(np.prod(spacing)) / max(float(np.sum(np.abs(normal) * spacing)), 1e-8)
+            opening_radius = float(np.sqrt(area / np.pi))
+            if config.min_ostium_radius_mm is not None and opening_radius < config.min_ostium_radius_mm:
+                continue
+            root = int(np.argmin(np.linalg.norm((points - ostium) * spacing, axis=1)))
+            distance, children, reach = _rooted_tree(adjacency, root)
+            indices = [root]
+            current = root
+            stopped_at_fork = False
+            while children[current]:
+                significant = [j for j in children[current]
+                               if reach[j] - distance[current] >= config.spur_length_mm]
+                if len(significant) > 1:
+                    stopped_at_fork = True
+                    break
+                following = max(children[current], key=lambda j: reach[j])
+                indices.append(following)
+                current = following
+                if distance[current] > config.max_path_length_mm + 2 * max(spacing):
+                    break
+            raw_path = np.vstack([ostium, points[indices]])
+            path, arc = _resample_path(raw_path, spacing, config.max_path_length_mm)
+            if arc[-1] < config.seed_distance_mm - 1e-6:
+                if stopped_at_fork:
+                    early_forks += 1
+                continue
+            # All traced points after the opening must remain in this component;
+            # this also rejects a straight root connector that cuts across tissue.
+            if np.any(_sample(vessel, path[arc >= min(spacing)]) < 0.5):
+                continue
+            roi_path = path + offset
+            if np.any(_sample(shell.astype(np.uint8), roi_path[arc >= min(spacing)], order=0) < 0.5):
+                # Clip the path at the first shell exit, never jump over an exit.
+                inside = _sample(shell.astype(np.uint8), roi_path, order=0) >= 0.5
+                exits = np.flatnonzero((arc >= min(spacing)) & ~inside)
+                if exits.size:
+                    path, arc = path[:exits[0]], arc[:exits[0]]
+                if not arc.size or arc[-1] < config.seed_distance_mm - 1e-6:
+                    continue
+            seed = np.array([np.interp(config.seed_distance_mm, arc, path[:, a]) for a in range(3)])
+            before = np.array([np.interp(config.seed_distance_mm - 1.0, arc, path[:, a]) for a in range(3)])
+            after = np.array([np.interp(min(arc[-1], config.seed_distance_mm + 1.0), arc, path[:, a]) for a in range(3)])
+            tangent = (after - before) * spacing
+            if np.linalg.norm(tangent) < 1e-8:
+                continue
+            section = _cross_section(vessel, seed, tangent, spacing,
+                                     max_radius=config.max_seed_radius_mm)
+            if section is None:
+                continue
+            radius, aspect_ratio = section
+            # Sheet-like sections and very broad blobs are not tubular evidence.
+            if aspect_ratio > config.max_cross_section_ratio or arc[-1] < 1.5 * radius:
+                continue
+            global_path = path + offset + origin
+            global_ostium = ostium + offset + origin
+            global_seed = seed + offset + origin
+            ostium_xyz = zyx_to_physical_xyz(image, global_ostium)
+            seed_xyz = zyx_to_physical_xyz(image, global_seed)
+            if np.linalg.norm(np.asarray(seed_xyz) - ostium_xyz) < 1e-8:
+                continue
+            results.append({
+                "parent_instance_id": "aorta",
+                "ostium_zyx": global_ostium.tolist(),
+                "seed_zyx": global_seed.tolist(),
+                "ostium_xyz_mm": ostium_xyz,
+                "seed_xyz_mm": seed_xyz,
+                "radius_mm": radius,
+                "direction_xyz": unit_direction_xyz(ostium_xyz, seed_xyz),
+                "centreline_zyx": global_path.tolist(),
+                "centreline_xyz_mm": [zyx_to_physical_xyz(image, p) for p in global_path],
+                "path_length_mm": float(arc[-1]),
+                "ostium_radius_mm": opening_radius,
+                "quality": {"cross_section_ratio": aspect_ratio,
+                            "stopped_at_bifurcation": stopped_at_fork,
+                            "method": "intensity_wall_connection_skeleton"},
+            })
+    results.sort(key=lambda branch: tuple(branch["ostium_zyx"]))
+    for index, branch in enumerate(results, start=1):
+        branch["instance_id"] = f"branch_{index:03d}"
+    if early_forks:
+        warnings.warn(
+            f"{early_forks} candidate opening(s) bifurcate before the "
+            f"{config.seed_distance_mm:g} mm seed distance and were omitted; "
+            "the challenge must clarify seed placement for these common trunks.",
+            RuntimeWarning, stacklevel=2,
+        )
+    return results

@@ -9,7 +9,7 @@ from scipy.ndimage import distance_transform_edt
 def make_aorta_shell(
     mask_np: np.ndarray,
     spacing_xyz: tuple[float, float, float],
-    outer_distance_mm: float = 8.0,
+    outer_distance_mm: float = 10.0,
 ) -> np.ndarray:
     """Return voxels outside and within `outer_distance_mm` of the aorta."""
     aorta = np.asarray(mask_np) > 0
