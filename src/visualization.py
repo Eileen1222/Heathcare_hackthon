@@ -19,7 +19,9 @@ def create_slice_figure(
     plane: str = "axial",
     spacing_zyx: Iterable[float] = (1.0, 1.0, 1.0),
     show_mask: bool = True,
-    show_points: bool = True,
+    show_ostia: bool = True,
+    show_seeds: bool = True,
+    show_directions: bool = True,
     show_centerlines: bool = True,
     show_radius: bool = True,
 ) -> go.Figure:
@@ -89,18 +91,33 @@ def create_slice_figure(
         )
 
     tolerance_mm = max(1.0, 0.75 * spacing[fixed_axis])
-    branch_colors = (
-        "#00d4ff",
-        "#7bed9f",
-        "#ffd166",
-        "#ff6b9d",
-        "#a78bfa",
-        "#45e0a8",
+    # Each pair contains a saturated branch/direction color and a lighter
+    # same-family centerline color.
+    branch_palette = (
+        ("#00a8cc", "#7ee8fa"),
+        ("#2eae67", "#9cf2c0"),
+        ("#e2a400", "#ffe49a"),
+        ("#d94f87", "#ffadd0"),
+        ("#805ad5", "#c4b5fd"),
+        ("#008f72", "#7de2cb"),
     )
     for branch_index, branch in enumerate(branches):
         branch_id = str(branch.get("instance_id", f"branch_{branch_index + 1:03d}"))
-        color = branch_colors[branch_index % len(branch_colors)]
-        legend_shown = False
+        color, centerline_color = branch_palette[branch_index % len(branch_palette)]
+        # A legend-only marker keeps the branch list stable even when the
+        # selected slice does not intersect that branch.
+        figure.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker={"size": 9, "color": color},
+                name=branch_id,
+                legendgroup=branch_id,
+                showlegend=True,
+                hoverinfo="skip",
+            )
+        )
 
         if show_centerlines and branch.get("centreline_zyx"):
             centreline = np.asarray(branch["centreline_zyx"], dtype=float)
@@ -124,17 +141,16 @@ def create_slice_figure(
                         x=line_x,
                         y=line_y,
                         mode="lines+markers",
-                        line={"color": color, "width": 3},
-                        marker={"color": color, "size": 3},
-                        name=branch_id,
+                        line={"color": centerline_color, "width": 3, "dash": "dot"},
+                        marker={"color": centerline_color, "size": 3},
+                        name=f"{branch_id} centerline",
                         legendgroup=branch_id,
-                        showlegend=True,
+                        showlegend=False,
                         hovertemplate=f"{branch_id} centerline<extra></extra>",
                     )
                 )
-                legend_shown = True
 
-        if not show_points:
+        if not (show_ostia or show_seeds or show_directions or show_radius):
             continue
 
         ostium = np.asarray(branch["ostium_zyx"], dtype=float)
@@ -152,7 +168,7 @@ def create_slice_figure(
         seed_x = float(seed[column_axis] * spacing[column_axis])
         seed_y = float(seed[row_axis] * spacing[row_axis])
 
-        if ostium_near:
+        if show_ostia and ostium_near:
             figure.add_trace(
                 go.Scatter(
                     x=[ostium_x],
@@ -168,7 +184,7 @@ def create_slice_figure(
                     textfont={"color": color},
                     name=branch_id,
                     legendgroup=branch_id,
-                    showlegend=not legend_shown,
+                    showlegend=False,
                     hovertemplate=(
                         f"{branch_id}<br>ostium"
                         f"<br>z/y/x={ostium[0]:.1f}/{ostium[1]:.1f}/{ostium[2]:.1f}"
@@ -176,27 +192,30 @@ def create_slice_figure(
                     ),
                 )
             )
-            legend_shown = True
+
+        if show_directions and ostium_near:
             # The arrow is the projection of the 3D ostium-to-seed direction
             # into the selected viewing plane.
-            figure.add_annotation(
-                x=seed_x,
-                y=seed_y,
-                ax=ostium_x,
-                ay=ostium_y,
-                xref="x",
-                yref="y",
-                axref="x",
-                ayref="y",
-                showarrow=True,
-                arrowhead=3,
-                arrowsize=1.2,
-                arrowwidth=3,
-                arrowcolor=color,
-                text="",
+            figure.add_trace(
+                go.Scatter(
+                    x=[ostium_x, seed_x],
+                    y=[ostium_y, seed_y],
+                    mode="lines+markers",
+                    line={"color": color, "width": 3},
+                    marker={
+                        "color": color,
+                        "size": [0, 12],
+                        "symbol": ["circle", "arrow"],
+                        "angleref": "previous",
+                    },
+                    name=f"{branch_id} direction",
+                    legendgroup=branch_id,
+                    showlegend=False,
+                    hovertemplate=f"{branch_id} direction<extra></extra>",
+                )
             )
 
-        if seed_near or ostium_near:
+        if show_seeds and (seed_near or (show_directions and ostium_near)):
             is_projection = not seed_near
             figure.add_trace(
                 go.Scatter(
@@ -222,17 +241,24 @@ def create_slice_figure(
 
         if show_radius and seed_near:
             radius = float(branch["radius_mm"])
-            figure.add_shape(
-                type="circle",
-                x0=seed_x - radius,
-                x1=seed_x + radius,
-                y0=seed_y - radius,
-                y1=seed_y + radius,
-                line={"color": color, "width": 2, "dash": "dot"},
+            angles = np.linspace(0.0, 2.0 * np.pi, 65)
+            figure.add_trace(
+                go.Scatter(
+                    x=seed_x + radius * np.cos(angles),
+                    y=seed_y + radius * np.sin(angles),
+                    mode="lines",
+                    line={"color": color, "width": 2, "dash": "dot"},
+                    name=f"{branch_id} radius",
+                    legendgroup=branch_id,
+                    showlegend=False,
+                    hovertemplate=(
+                        f"{branch_id}<br>radius={radius:.2f} mm<extra></extra>"
+                    ),
+                )
             )
 
     figure.update_layout(
-        height=430,
+        height=580,
         margin={"l": 10, "r": 10, "t": 45, "b": 10},
         title={
             "text": f"{plane.capitalize()} slice {axis_name}={slice_index}",
@@ -245,6 +271,18 @@ def create_slice_figure(
             "autorange": "reversed",
             "scaleanchor": "x",
             "scaleratio": 1,
+        },
+        legend={
+            "title": {"text": "Branches"},
+            "x": 0.01,
+            "xanchor": "left",
+            "y": 0.99,
+            "yanchor": "top",
+            "bgcolor": "rgba(14, 17, 23, 0.72)",
+            "bordercolor": "rgba(255, 255, 255, 0.25)",
+            "borderwidth": 1,
+            "font": {"color": "#fafafa"},
+            "groupclick": "togglegroup",
         },
     )
     return figure
