@@ -7,7 +7,12 @@ instance colours.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Iterable, Sequence
+
+# Headless / Streamlit Cloud: VTK must not require a local X display.
+os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
+os.environ.setdefault("VTK_DEFAULT_OPENGL_WINDOW", "vtkOSOpenGLRenderWindow")
 
 import numpy as np
 import plotly.graph_objects as go
@@ -22,6 +27,9 @@ try:
 
     _HAS_PYVISTA = True
 except ImportError:  # pragma: no cover - exercised only without pyvista
+    pv = None
+    _HAS_PYVISTA = False
+except Exception:  # pragma: no cover - missing libGL etc. on bare Linux
     pv = None
     _HAS_PYVISTA = False
 
