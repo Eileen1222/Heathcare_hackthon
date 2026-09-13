@@ -276,7 +276,14 @@ if current_signature != st.session_state.input_signature:
         "slice_z",
         "slice_y",
         "slice_x",
+        "2d_sl_z",
+        "2d_sl_y",
+        "2d_sl_x",
         "focused_branch_id",
+        "active_slice_slider",
+        "_ct_slider_sync",
+        "_slice_external_rev",
+        "slice_plane",
         "branch_selector_widget",
         "c3d_plane_type",
     ):
@@ -360,12 +367,21 @@ st.markdown(
 )
 
 # Initialize interactive linkage session states
+shape_z, shape_y, shape_x = (int(v) for v in result["image_np"].shape)
 if "slice_z" not in st.session_state:
-    st.session_state.slice_z = result["image_np"].shape[0] // 2
+    st.session_state.slice_z = shape_z // 2
 if "slice_y" not in st.session_state:
-    st.session_state.slice_y = result["image_np"].shape[1] // 2
+    st.session_state.slice_y = shape_y // 2
 if "slice_x" not in st.session_state:
-    st.session_state.slice_x = result["image_np"].shape[2] // 2
+    st.session_state.slice_x = shape_x // 2
+# Always-mounted 2D sliders use dedicated keys so plane switches never unmount
+# a key (Streamlit deletes unmounted widget values — that was wiping slice_z).
+if "2d_sl_z" not in st.session_state:
+    st.session_state["2d_sl_z"] = int(st.session_state.slice_z)
+if "2d_sl_y" not in st.session_state:
+    st.session_state["2d_sl_y"] = int(st.session_state.slice_y)
+if "2d_sl_x" not in st.session_state:
+    st.session_state["2d_sl_x"] = int(st.session_state.slice_x)
 if "focused_branch_id" not in st.session_state:
     st.session_state.focused_branch_id = None
 
@@ -388,9 +404,13 @@ def select_branch() -> None:
     )
     if branch and branch.get("ostium_zyx"):
         oz, oy, ox = [int(round(value)) for value in branch["ostium_zyx"]]
+        # Write both the 3D-linkage aliases and the always-mounted 2D slider keys.
         st.session_state.slice_z = oz
         st.session_state.slice_y = oy
         st.session_state.slice_x = ox
+        st.session_state["2d_sl_z"] = oz
+        st.session_state["2d_sl_y"] = oy
+        st.session_state["2d_sl_x"] = ox
 
 
 def jump_to_branch(coordinate_key: str) -> None:
@@ -409,6 +429,9 @@ def jump_to_branch(coordinate_key: str) -> None:
     st.session_state.slice_z = z
     st.session_state.slice_y = y
     st.session_state.slice_x = x
+    st.session_state["2d_sl_z"] = z
+    st.session_state["2d_sl_y"] = y
+    st.session_state["2d_sl_x"] = x
 
 
 def reset_branch_focus() -> None:
@@ -554,55 +577,19 @@ st.plotly_chart(
 )
 
 
-@st.fragment
 def render_ct_viewer(case_result: dict[str, Any], focused_branch_id: str | None) -> None:
-    """Rerun only the active 2D viewer when its controls change."""
+    """Interactive 2D CT viewer with per-axis slice state that survives plane switches."""
     st.subheader("CT / detection overlay")
     slice_plot_config = {
         "scrollZoom": True,
         "displaylogo": False,
     }
     spacing_zyx = case_result["image"].GetSpacing()[::-1]
-    slice_view_col, layer_controls_col = st.columns([5, 1], gap="medium")
-
-    with layer_controls_col:
-        st.markdown("#### Layers")
-        show_mask = st.checkbox("🟧 Aorta mask", value=True)
-        show_ostia = st.checkbox("🟡 Ostia", value=True)
-        show_seeds = st.checkbox("◆ 5 mm seeds", value=True)
-        show_directions = st.checkbox("➜ Directions", value=True)
-        show_centerlines = st.checkbox("┈ Centerlines", value=True)
-        show_radius = st.checkbox("◯ Seed radius", value=True)
-        st.caption(
-            "Each branch has one saturated color. Star (★) marks the currently "
-            "focused branch. An × marks a seed projected from a nearby slice."
-        )
-        st.markdown("#### Image size")
-        slice_height = st.select_slider(
-            "Image size",
-            options=[440, 500, 560, 640],
-            value=500,
-            format_func=lambda x: f"{x}px",
-            key="slice_figure_height",
-            label_visibility="collapsed",
-        )
-
+    shape = case_result["image_np"].shape
     plane_specs = {
-        "Axial (Z)": ("axial", 0, "z", "slice_z"),
-        "Coronal (Y)": ("coronal", 1, "y", "slice_y"),
-        "Sagittal (X)": ("sagittal", 2, "x", "slice_x"),
-    }
-    slice_options = {
-        "branches": case_result["branches"],
-        "spacing_zyx": spacing_zyx,
-        "show_mask": show_mask,
-        "show_ostia": show_ostia,
-        "show_seeds": show_seeds,
-        "show_directions": show_directions,
-        "show_centerlines": show_centerlines,
-        "show_radius": show_radius,
-        "focused_branch_id": focused_branch_id,
-        "figure_height": slice_height,
+        "Axial (Z)": ("axial", 0, "z", "2d_sl_z"),
+        "Coronal (Y)": ("coronal", 1, "y", "2d_sl_y"),
+        "Sagittal (X)": ("sagittal", 2, "x", "2d_sl_x"),
     }
 
     def format_intersections(branches: list[dict], axis: int, slice_val: int, spacing: float) -> list[str]:
@@ -623,43 +610,82 @@ def render_ct_viewer(case_result: dict[str, Any], focused_branch_id: str | None)
                 hits.append(f"**{bid}** ({', '.join(parts)})")
         return hits
 
-    with slice_view_col:
-        selected_view = st.radio(
-            "Viewing plane",
-            list(plane_specs),
-            horizontal=True,
-            label_visibility="collapsed",
-            key="slice_plane",
-        )
-        plane, axis, axis_name, slider_key = plane_specs[selected_view]
-        slice_index = st.slider(
-            f"{selected_view} slice ({axis_name})",
+    selected_view = st.radio(
+        "Viewing plane",
+        list(plane_specs),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="slice_plane",
+    )
+    plane, axis, axis_name, _active_key = plane_specs[selected_view]
+
+    # Mount all three sliders every run. Unmounting the inactive plane's slider
+    # used to delete its session value, so Z→Y→Z jumped to a default/wrong slice.
+    z_col, y_col, x_col = st.columns(3)
+    with z_col:
+        z_idx = st.slider(
+            "Axial (Z)",
             0,
-            case_result["image_np"].shape[axis] - 1,
-            value=int(st.session_state.get(slider_key, case_result["image_np"].shape[axis] // 2)),
-            key=slider_key,
+            int(shape[0] - 1),
+            key="2d_sl_z",
+            disabled=selected_view != "Axial (Z)",
+        )
+    with y_col:
+        y_idx = st.slider(
+            "Coronal (Y)",
+            0,
+            int(shape[1] - 1),
+            key="2d_sl_y",
+            disabled=selected_view != "Coronal (Y)",
+        )
+    with x_col:
+        x_idx = st.slider(
+            "Sagittal (X)",
+            0,
+            int(shape[2] - 1),
+            key="2d_sl_x",
+            disabled=selected_view != "Sagittal (X)",
         )
 
-        hits = format_intersections(
-            case_result["branches"],
-            axis,
-            int(slice_index),
-            spacing_zyx[axis],
-        )
-        if hits:
-            st.info(f"🎯 **Current {selected_view} slice ({axis_name}={slice_index}) intersects:** " + " · ".join(hits))
+    # Keep 3D linkage aliases in sync with the always-mounted 2D sliders.
+    st.session_state.slice_z = int(z_idx)
+    st.session_state.slice_y = int(y_idx)
+    st.session_state.slice_x = int(x_idx)
 
-        st.plotly_chart(
-            create_slice_figure(
-                case_result["image_np"],
-                case_result["mask_np"],
-                slice_index,
-                plane=plane,
-                **slice_options,
-            ),
-            use_container_width=True,
-            config=slice_plot_config,
+    slice_index = {"axial": int(z_idx), "coronal": int(y_idx), "sagittal": int(x_idx)}[
+        plane
+    ]
+
+    hits = format_intersections(
+        case_result["branches"],
+        axis,
+        slice_index,
+        spacing_zyx[axis],
+    )
+    if hits:
+        st.info(
+            f"🎯 **Current {selected_view} slice ({axis_name}={slice_index}) intersects:** "
+            + " · ".join(hits)
         )
+
+    st.plotly_chart(
+        create_slice_figure(
+            case_result["image_np"],
+            case_result["mask_np"],
+            slice_index,
+            plane=plane,
+            branches=case_result["branches"],
+            spacing_zyx=spacing_zyx,
+            focused_branch_id=focused_branch_id,
+            figure_height=500,
+        ),
+        use_container_width=True,
+        config=slice_plot_config,
+        # Include plane+slice so Streamlit cannot restore a stale Plotly figure
+        # from another index under a shared chart identity.
+        key=f"ct_2d_{plane}_{slice_index}",
+        theme=None,
+    )
 
 
 render_ct_viewer(result, st.session_state.focused_branch_id)

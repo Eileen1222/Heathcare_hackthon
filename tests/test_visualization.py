@@ -142,10 +142,48 @@ class VisualizationTests(unittest.TestCase):
         )
         self.assertGreater(len(fig.data), 0)
         ostium_traces = [
-            t for t in fig.data if getattr(t, "name", None) == "branch_001"
+            t
+            for t in fig.data
+            if getattr(t, "name", None) == "Ostia"
         ]
         self.assertTrue(ostium_traces)
-        self.assertEqual(ostium_traces[0].marker.color, CLINICAL_OSTIUM)
+        self.assertEqual(ostium_traces[0].marker.color, "#ffe066")
+        direction_traces = [
+            t
+            for t in fig.data
+            if getattr(t, "name", None) == "Directions"
+        ]
+        self.assertTrue(direction_traces)
+        self.assertEqual(direction_traces[0].line.color, "#00a8cc")
+        self.assertNotEqual(getattr(direction_traces[0].line, "dash", None), "dot")
+        centerline_traces = [
+            t
+            for t in fig.data
+            if getattr(t, "name", None) == "Centerlines"
+        ]
+        self.assertTrue(centerline_traces)
+        self.assertEqual(centerline_traces[0].line.color, "#7ee8fa")
+        self.assertEqual(centerline_traces[0].line.dash, "dot")
+        self.assertEqual(fig.layout.uirevision, "axial:10")
+        self.assertTrue(fig.layout.showlegend)
+        self.assertEqual(fig.layout.legend.groupclick, "togglegroup")
+
+        hidden = create_slice_figure(
+            image_np,
+            mask_np,
+            10,
+            branches=branches,
+            plane="axial",
+            show_mask=False,
+            show_ostia=False,
+            show_seeds=False,
+            show_directions=False,
+            show_centerlines=False,
+            show_radius=False,
+        )
+        # Layer kwargs only set initial legend visibility; trace count stays stable.
+        self.assertEqual(len(fig.data), len(hidden.data))
+        self.assertEqual(hidden.data[1].visible, "legendonly")
 
     def test_aorta_figure_empty_branches(self):
         mask = np.zeros((20, 20, 20), dtype=np.uint8)

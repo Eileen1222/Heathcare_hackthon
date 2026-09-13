@@ -1,8 +1,8 @@
 """Interactive 2D and 3D Plotly visualizations.
 
-Clinical workstation style: one contrast-lumen material for the whole vessel
-tree; branch identity comes from selection highlight and labels, not rainbow
-instance colours.
+2D CT overlays use per-branch saturated colors for direction arrows and lighter
+dotted same-family shades for centerlines. 3D keeps a unified clinical lumen
+material; branch identity there comes from selection highlight and labels.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover - missing libGL etc. on bare Linux
     pv = None
     _HAS_PYVISTA = False
 
-# Dual-layer vessel look: lighter translucent lumen + darker rim/edge.
+# Dual-layer vessel look for 3D: lighter translucent lumen + darker rim/edge.
 CLINICAL_VESSEL = "#ff0000"
 CLINICAL_VESSEL_INNER = "#ff7a7a"
 CLINICAL_VESSEL_RIM = "#9a0000"
@@ -41,10 +41,10 @@ CLINICAL_AORTA = CLINICAL_VESSEL
 CLINICAL_VESSEL_SELECTED = CLINICAL_VESSEL
 CLINICAL_CENTERLINE = "#6b7280"
 CLINICAL_CENTERLINE_SELECTED = "#f8fafc"
-CLINICAL_OSTIUM = "#ffffff"
+CLINICAL_OSTIUM = "#ffe066"
 CLINICAL_SEED = "#7dd3d8"
 CLINICAL_DIRECTION = "#ffffff"
-CLINICAL_MASK_2D = "#ff3333"
+CLINICAL_MASK_2D = "#ff7f0e"
 CLINICAL_LABEL = "#ffffff"
 CLINICAL_LABEL_SELECTED = "#ffe566"
 SLICE_PLANE_COLORS = {
@@ -53,8 +53,17 @@ SLICE_PLANE_COLORS = {
     "sagittal": "#a89f8c",
 }
 
-# Kept for any external imports; maps to the unified clinical vessel colour.
-BRANCH_COLORS: tuple[str, ...] = (CLINICAL_VESSEL,)
+# 2D overlays: saturated direction colour + lighter same-family centerline.
+BRANCH_PALETTE_2D: tuple[tuple[str, str], ...] = (
+    ("#00a8cc", "#7ee8fa"),
+    ("#2eae67", "#9cf2c0"),
+    ("#e2a400", "#ffe49a"),
+    ("#d94f87", "#ffadd0"),
+    ("#805ad5", "#c4b5fd"),
+    ("#008f72", "#7de2cb"),
+)
+BRANCH_COLORS: tuple[str, ...] = tuple(color for color, _ in BRANCH_PALETTE_2D)
+OSTIUM_2D = "#ffe066"
 
 
 def create_slice_figure(
@@ -107,6 +116,10 @@ def create_slice_figure(
     if window_min == window_max:
         window_max = window_min + 1.0
 
+    # Always emit overlays. Layer show/hide is done via Plotly legend
+    # (groupclick) so Streamlit does not rebuild the chart and wipe zoom.
+    # (Streamlit 1.63 identities plotly charts by full figure JSON.)
+    view_revision = f"{plane}:{int(slice_index)}"
     figure = go.Figure()
     figure.add_trace(
         go.Heatmap(
@@ -118,41 +131,50 @@ def create_slice_figure(
             zmax=float(window_max),
             showscale=False,
             name="CT",
+            uid=f"ct:{view_revision}",
+            showlegend=False,
             hovertemplate=(
                 "horizontal=%{x:.1f} mm<br>vertical=%{y:.1f} mm"
                 "<br>HU=%{z:.0f}<extra>CT</extra>"
             ),
         )
     )
-    if show_mask:
-        figure.add_trace(
-            go.Heatmap(
-                x=x_coordinates,
-                y=y_coordinates,
-                z=np.where(mask_slice, 1.0, np.nan),
-                colorscale=[[0.0, CLINICAL_MASK_2D], [1.0, CLINICAL_MASK_2D]],
-                zmin=0.0,
-                zmax=1.0,
-                showscale=False,
-                opacity=0.35,
-                name="Aorta mask",
-                hoverinfo="skip",
-            )
+    figure.add_trace(
+        go.Heatmap(
+            x=x_coordinates,
+            y=y_coordinates,
+            z=np.where(mask_slice, 1.0, np.nan),
+            colorscale=[[0.0, CLINICAL_MASK_2D], [1.0, CLINICAL_MASK_2D]],
+            zmin=0.0,
+            zmax=1.0,
+            showscale=False,
+            opacity=0.35,
+            name="Aorta mask",
+            uid=f"mask:{view_revision}",
+            legendgroup="layer_mask",
+            showlegend=True,
+            visible=True if show_mask else "legendonly",
+            hoverinfo="skip",
         )
+    )
 
     tolerance_mm = max(1.0, 0.75 * spacing[fixed_axis])
+    centerline_legend_shown = False
+    ostium_legend_shown = False
+    direction_legend_shown = False
+    seed_legend_shown = False
+    radius_legend_shown = False
+
     for branch_index, branch in enumerate(branches):
         branch_id = str(branch.get("instance_id", f"branch_{branch_index + 1:03d}"))
+        color, centerline_color = BRANCH_PALETTE_2D[
+            branch_index % len(BRANCH_PALETTE_2D)
+        ]
         is_focused = focused_branch_id is not None and branch_id == focused_branch_id
         is_dimmed = focused_branch_id is not None and not is_focused
-        trace_opacity = 1.0 if not is_dimmed else 0.28
-        accent = CLINICAL_VESSEL_SELECTED if is_focused else CLINICAL_VESSEL
-        centerline_color = (
-            CLINICAL_CENTERLINE_SELECTED if is_focused else CLINICAL_CENTERLINE
-        )
-        label_color = CLINICAL_DIRECTION if is_focused else "#64748b"
+        trace_opacity = 1.0 if not is_dimmed else 0.30
 
-        if show_centerlines and branch.get("centreline_zyx"):
+        if branch.get("centreline_zyx"):
             centreline = np.asarray(branch["centreline_zyx"], dtype=float)
             near_slice = (
                 np.abs(centreline[:, fixed_axis] - slice_index)
@@ -169,6 +191,8 @@ def create_slice_figure(
                     line_x.append(None)
                     line_y.append(None)
             if any(value is not None for value in line_x):
+                show_cl_legend = not centerline_legend_shown
+                centerline_legend_shown = True
                 figure.add_trace(
                     go.Scatter(
                         x=line_x,
@@ -181,15 +205,14 @@ def create_slice_figure(
                         },
                         marker={"color": centerline_color, "size": 3},
                         opacity=trace_opacity,
-                        name=f"{branch_id} centerline",
-                        legendgroup=branch_id,
-                        showlegend=False,
+                        name="Centerlines",
+                        uid=f"{branch_id}:centerline:{view_revision}",
+                        legendgroup="layer_centerlines",
+                        showlegend=show_cl_legend,
+                        visible=True if show_centerlines else "legendonly",
                         hovertemplate=f"{branch_id} centerline<extra></extra>",
                     )
                 )
-
-        if not (show_ostia or show_seeds or show_directions or show_radius):
-            continue
 
         ostium = np.asarray(branch["ostium_zyx"], dtype=float)
         seed = np.asarray(branch["seed_zyx"], dtype=float)
@@ -206,7 +229,9 @@ def create_slice_figure(
         seed_x = float(seed[column_axis] * spacing[column_axis])
         seed_y = float(seed[row_axis] * spacing[row_axis])
 
-        if show_ostia and ostium_near:
+        if ostium_near:
+            show_ost_legend = not ostium_legend_shown
+            ostium_legend_shown = True
             figure.add_trace(
                 go.Scatter(
                     x=[ostium_x],
@@ -214,19 +239,24 @@ def create_slice_figure(
                     mode="markers+text",
                     marker={
                         "size": 12 if is_focused else 10,
-                        "color": CLINICAL_OSTIUM,
+                        "color": OSTIUM_2D,
                         "line": {
-                            "color": accent,
+                            "color": color,
                             "width": 2 if is_focused else 1,
                         },
                     },
                     text=[f"★ {branch_id}" if is_focused else branch_id],
                     textposition="top center",
-                    textfont={"color": label_color, "size": 11 if is_focused else 10},
+                    textfont={
+                        "color": color,
+                        "size": 11 if is_focused else 10,
+                    },
                     opacity=trace_opacity,
-                    name=branch_id,
-                    legendgroup=branch_id,
-                    showlegend=False,
+                    name="Ostia",
+                    uid=f"{branch_id}:ostium:{view_revision}",
+                    legendgroup="layer_ostia",
+                    showlegend=show_ost_legend,
+                    visible=True if show_ostia else "legendonly",
                     hovertemplate=(
                         f"{branch_id}<br>ostium"
                         f"<br>z/y/x={ostium[0]:.1f}/{ostium[1]:.1f}/{ostium[2]:.1f}"
@@ -235,34 +265,42 @@ def create_slice_figure(
                 )
             )
 
-        if show_directions and ostium_near:
-            # The arrow is the projection of the 3D ostium-to-seed direction
-            # into the selected viewing plane.
+            show_dir_legend = not direction_legend_shown
+            direction_legend_shown = True
             figure.add_trace(
                 go.Scatter(
                     x=[ostium_x, seed_x],
                     y=[ostium_y, seed_y],
                     mode="lines+markers",
                     line={
-                        "color": CLINICAL_DIRECTION,
+                        "color": color,
                         "width": 3 if is_focused else 2,
                     },
                     marker={
-                        "color": CLINICAL_DIRECTION,
+                        "color": color,
                         "size": [0, 12 if is_focused else 10],
                         "symbol": ["circle", "arrow"],
                         "angleref": "previous",
                     },
                     opacity=trace_opacity,
-                    name=f"{branch_id} direction",
-                    legendgroup=branch_id,
-                    showlegend=False,
+                    name="Directions",
+                    uid=f"{branch_id}:direction:{view_revision}",
+                    legendgroup="layer_directions",
+                    showlegend=show_dir_legend,
+                    visible=True if show_directions else "legendonly",
                     hovertemplate=f"{branch_id} direction<extra></extra>",
                 )
             )
 
-        if show_seeds and (seed_near or (show_directions and ostium_near)):
+        if seed_near or ostium_near:
             is_projection = not seed_near
+            # Projection seeds track the direction overlay; on-slice seeds are
+            # independent.
+            seed_on = bool(show_seeds) and (
+                seed_near or bool(show_directions)
+            )
+            show_seed_legend = not seed_legend_shown
+            seed_legend_shown = True
             figure.add_trace(
                 go.Scatter(
                     x=[seed_x],
@@ -271,16 +309,18 @@ def create_slice_figure(
                     marker={
                         "size": 10 if is_focused else 8,
                         "symbol": "x" if is_projection else "diamond",
-                        "color": CLINICAL_SEED,
+                        "color": color,
                         "line": {
-                            "color": accent,
+                            "color": "#0f172a",
                             "width": 1 if is_focused else 0,
                         },
                     },
                     opacity=trace_opacity,
-                    name=f"{branch_id} seed",
-                    legendgroup=branch_id,
-                    showlegend=False,
+                    name="5 mm seeds",
+                    uid=f"{branch_id}:seed:{view_revision}",
+                    legendgroup="layer_seeds",
+                    showlegend=show_seed_legend,
+                    visible=True if seed_on else "legendonly",
                     hovertemplate=(
                         f"{branch_id}<br>"
                         + ("seed projection" if is_projection else "5 mm seed")
@@ -290,23 +330,27 @@ def create_slice_figure(
                 )
             )
 
-        if show_radius and seed_near:
+        if seed_near:
             radius = float(branch["radius_mm"])
             angles = np.linspace(0.0, 2.0 * np.pi, 65)
+            show_rad_legend = not radius_legend_shown
+            radius_legend_shown = True
             figure.add_trace(
                 go.Scatter(
                     x=seed_x + radius * np.cos(angles),
                     y=seed_y + radius * np.sin(angles),
                     mode="lines",
                     line={
-                        "color": CLINICAL_SEED,
+                        "color": centerline_color,
                         "width": 2 if is_focused else 1,
                         "dash": "dot",
                     },
                     opacity=trace_opacity,
-                    name=f"{branch_id} radius",
-                    legendgroup=branch_id,
-                    showlegend=False,
+                    name="Seed radius",
+                    uid=f"{branch_id}:radius:{view_revision}",
+                    legendgroup="layer_radius",
+                    showlegend=show_rad_legend,
+                    visible=True if show_radius else "legendonly",
                     hovertemplate=(
                         f"{branch_id}<br>radius={radius:.2f} mm<extra></extra>"
                     ),
@@ -318,19 +362,44 @@ def create_slice_figure(
         margin={"l": 8, "r": 8, "t": 30, "b": 8},
         title={
             "text": f"{plane.capitalize()} slice {axis_name}={slice_index}",
-            "x": 0.5,
+            "x": 0.02,
             "y": 0.98,
+            "xanchor": "left",
             "font": {"size": 13},
         },
         dragmode="zoom",
-        xaxis={"visible": False, "constrain": "domain"},
+        # Keep zoom/pan when Streamlit remounts with the same plane/slice
+        # (e.g. focus change). Layer toggles use the legend and do not remount.
+        uirevision=view_revision,
+        xaxis={
+            "visible": False,
+            "constrain": "domain",
+            "range": [float(x_coordinates[0]), float(x_coordinates[-1])],
+            "uirevision": view_revision,
+        },
         yaxis={
             "visible": False,
-            "autorange": "reversed",
+            "range": [float(y_coordinates[-1]), float(y_coordinates[0])],
             "scaleanchor": "x",
             "scaleratio": 1,
+            "uirevision": view_revision,
         },
-        showlegend=False,
+        showlegend=True,
+        legend={
+            "title": {"text": "Layers"},
+            "groupclick": "togglegroup",
+            "itemsizing": "constant",
+            "tracegroupgap": 2,
+            "orientation": "v",
+            "yanchor": "top",
+            "y": 0.98,
+            "xanchor": "left",
+            "x": 1.01,
+            "bgcolor": "rgba(15, 23, 42, 0.88)",
+            "bordercolor": "rgba(148, 163, 184, 0.35)",
+            "borderwidth": 1,
+            "font": {"size": 11, "color": "#e2e8f0"},
+        },
     )
     return figure
 
