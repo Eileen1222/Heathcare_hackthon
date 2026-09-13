@@ -51,10 +51,30 @@ class DetectionConfig:
     duplicate_overlap_fraction: float = 0.60
     duplicate_gap_hu: float = 50.0
     duplicate_gap_fraction: float = 0.70
-    # User-selected strict duplicate tolerance: only nearly identical tracks
-    # may contribute to the continuous centreline-overlap rule test.
-    duplicate_centreline_overlap_mm: float = 5.0
-    duplicate_centreline_distance_mm: float = 0.1
+    # Merge only when centreline tracks stay inside a shared lumen for a
+    # sustained distance. Nearby but truly separate origins must remain two.
+    duplicate_centreline_overlap_mm: float = 3.0
+    # Absolute floor; the effective distance is radius-aware (see below).
+    duplicate_centreline_distance_mm: float = 0.3
+
+
+def _effective_centreline_distance_mm(
+    first_radius_mm: float,
+    second_radius_mm: float,
+    config: DetectionConfig,
+) -> float:
+    """Distance threshold for treating two tracks as the same lumen.
+
+    Uses a fraction of the combined seed radii so thicker vessels can tolerate
+    modest centreline jitter, while preserving a small absolute floor for thin
+    branches. This is intentionally not an ostium-distance rule: two nearby but
+    truly separate openings must still survive when their paths diverge.
+    """
+    combined = max(0.0, float(first_radius_mm)) + max(0.0, float(second_radius_mm))
+    return max(
+        float(config.duplicate_centreline_distance_mm),
+        float(config.duplicate_overlap_radius_factor) * combined,
+    )
 
 
 def _bbox(binary: np.ndarray, margin: np.ndarray) -> tuple[slice, ...]:
@@ -342,7 +362,7 @@ def _duplicate_evidence(
     first_dense=None,
     second_dense=None,
 ):
-    """Use a low-HU gap first, then test sustained centreline overlap."""
+    """Use a low-HU gap first, then test sustained lumen-scale centreline overlap."""
     common_end = min(float(first["path_length_mm"]), float(second["path_length_mm"]),
                      config.max_path_length_mm)
     tail_start = max(config.seed_distance_mm,
@@ -371,10 +391,14 @@ def _duplicate_evidence(
     clear_intensity_gap = (
         gap_stations >= 3 and gap_fraction >= config.duplicate_gap_fraction
     )
+    centreline_distance = _effective_centreline_distance_mm(
+        first["radius_mm"], second["radius_mm"], config
+    )
     evidence = {
         "same_component": bool(same_component),
         "common_length_mm": common_end,
         "centreline_overlap_threshold_mm": config.duplicate_centreline_overlap_mm,
+        "centreline_distance_threshold_mm": float(centreline_distance),
         "comparable": True,
         "distal_separation_mm": float(separations[-1]),
         "distal_overlap_fraction": overlap_fraction,
@@ -394,10 +418,13 @@ def _duplicate_evidence(
     centreline_overlap = _centreline_overlap_length_mm(
         first,
         second,
-        config.duplicate_centreline_distance_mm,
+        centreline_distance,
         first_dense=first_dense,
         second_dense=second_dense,
     )
+    # Sustained lumen-scale overlap is the primary merge signal. Distal
+    # proximity alone is reported but never sufficient: two nearby origins that
+    # diverge quickly must remain separate challenge daughters.
     overlap_duplicate = (
         centreline_overlap > config.duplicate_centreline_overlap_mm + 1e-6
     )
@@ -407,20 +434,19 @@ def _duplicate_evidence(
         "centreline_overlap_mm": float(centreline_overlap),
         "reason": (
             "centreline_overlap_over_threshold"
-            if overlap_duplicate else "no_sustained_near_identical_overlap"
+            if overlap_duplicate else "no_sustained_lumen_scale_overlap"
         ),
         "possible_duplicate": overlap_duplicate,
     }
 
 
 def _remove_duplicate_branches(results, image_np, spacing, config):
-    """Collapse candidates only for sustained near-identical centrelines.
+    """Collapse candidates with sustained lumen-scale centreline overlap.
 
-    Any pair whose centrelines remain within the configured distance for longer
-    than the configured overlap length is eligible for
-    merging, even when threshold fragmentation assigned different components.
-    A persistent low-HU interval preserves two distinct vessels. Distal
-    proximity near 10 mm is reported but no longer triggers a merge.
+    A pair is eligible for merging when their centrelines remain within a
+    radius-aware distance for longer than the configured overlap length. A
+    persistent low-HU interval preserves two distinct vessels. Distal proximity
+    alone, or nearby ostia that quickly diverge, never trigger a merge.
     """
     if len(results) < 2:
         for branch in results:
@@ -453,12 +479,17 @@ def _remove_duplicate_branches(results, image_np, spacing, config):
     duplicate_pairs = []
     for first in range(len(results)):
         for second in range(first + 1, len(results)):
-            # A pair that cannot satisfy the strict <0.1 mm centreline rule can
-            # never be merged. Skip its much more expensive 3D HU profile test.
+            centreline_distance = _effective_centreline_distance_mm(
+                results[first]["radius_mm"],
+                results[second]["radius_mm"],
+                config,
+            )
+            # Skip pairs that cannot satisfy the radius-aware centreline rule
+            # before running the more expensive 3D HU profile test.
             if not _dense_paths_can_overlap(
                 dense_paths[first],
                 dense_paths[second],
-                config.duplicate_centreline_distance_mm,
+                centreline_distance,
             ):
                 skipped_distant[first] += 1
                 skipped_distant[second] += 1
@@ -739,8 +770,8 @@ def detect_branches(
     if duplicate_count:
         warnings.warn(
             f"Removed {duplicate_count} possible duplicate branch candidate(s) "
-            f"because their centrelines remained within "
-            f"{config.duplicate_centreline_distance_mm:g} mm for more than "
+            f"because their centrelines remained within a radius-aware lumen "
+            f"distance for more than "
             f"{config.duplicate_centreline_overlap_mm:g} mm.",
             RuntimeWarning, stacklevel=2,
         )
