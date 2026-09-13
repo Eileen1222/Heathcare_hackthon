@@ -1,4 +1,9 @@
-"""Interactive 2D and 3D Plotly visualizations."""
+"""Interactive 2D and 3D Plotly visualizations.
+
+Clinical workstation style: one contrast-lumen material for the whole vessel
+tree; branch identity comes from selection highlight and labels, not rainbow
+instance colours.
+"""
 
 from __future__ import annotations
 
@@ -8,21 +13,40 @@ import numpy as np
 import plotly.graph_objects as go
 import SimpleITK as sitk
 from skimage.measure import marching_cubes
+from scipy import ndimage as ndi
 
-BRANCH_COLORS: tuple[str, ...] = (
-    "#00d4ff",  
-    "#7bed9f",  
-    "#ffd166",  
-    "#ff6b9d",  
-    "#a78bfa",  
-    "#ffa502",  
-    "#48dbfb",  
-    "#2ed573",  
-    "#ff4757",  
-    "#1e90ff",  
-    "#eccc68",  
-    "#f368e0",  
-)
+from src.io_utils import physical_xyz_to_zyx
+
+try:
+    import pyvista as pv
+
+    _HAS_PYVISTA = True
+except ImportError:  # pragma: no cover - exercised only without pyvista
+    pv = None
+    _HAS_PYVISTA = False
+
+# Dual-layer vessel look: lighter translucent lumen + darker rim/edge.
+CLINICAL_VESSEL = "#ff0000"
+CLINICAL_VESSEL_INNER = "#ff7a7a"
+CLINICAL_VESSEL_RIM = "#9a0000"
+CLINICAL_AORTA = CLINICAL_VESSEL
+CLINICAL_VESSEL_SELECTED = CLINICAL_VESSEL
+CLINICAL_CENTERLINE = "#6b7280"
+CLINICAL_CENTERLINE_SELECTED = "#f8fafc"
+CLINICAL_OSTIUM = "#ffffff"
+CLINICAL_SEED = "#7dd3d8"
+CLINICAL_DIRECTION = "#ffffff"
+CLINICAL_MASK_2D = "#ff3333"
+CLINICAL_LABEL = "#ffffff"
+CLINICAL_LABEL_SELECTED = "#ffe566"
+SLICE_PLANE_COLORS = {
+    "axial": "#94a3b8",
+    "coronal": "#86a39a",
+    "sagittal": "#a89f8c",
+}
+
+# Kept for any external imports; maps to the unified clinical vessel colour.
+BRANCH_COLORS: tuple[str, ...] = (CLINICAL_VESSEL,)
 
 
 def create_slice_figure(
@@ -98,33 +122,27 @@ def create_slice_figure(
                 x=x_coordinates,
                 y=y_coordinates,
                 z=np.where(mask_slice, 1.0, np.nan),
-                colorscale=[[0.0, "#ff7f0e"], [1.0, "#ff7f0e"]],
+                colorscale=[[0.0, CLINICAL_MASK_2D], [1.0, CLINICAL_MASK_2D]],
                 zmin=0.0,
                 zmax=1.0,
                 showscale=False,
-                opacity=0.4,
+                opacity=0.35,
                 name="Aorta mask",
                 hoverinfo="skip",
             )
         )
 
     tolerance_mm = max(1.0, 0.75 * spacing[fixed_axis])
-    # Each pair contains a saturated branch/direction color and a lighter
-    # same-family centerline color.
-    branch_palette = (
-        ("#00a8cc", "#7ee8fa"),
-        ("#2eae67", "#9cf2c0"),
-        ("#e2a400", "#ffe49a"),
-        ("#d94f87", "#ffadd0"),
-        ("#805ad5", "#c4b5fd"),
-        ("#008f72", "#7de2cb"),
-    )
     for branch_index, branch in enumerate(branches):
         branch_id = str(branch.get("instance_id", f"branch_{branch_index + 1:03d}"))
-        color, centerline_color = branch_palette[branch_index % len(branch_palette)]
         is_focused = focused_branch_id is not None and branch_id == focused_branch_id
         is_dimmed = focused_branch_id is not None and not is_focused
-        trace_opacity = 1.0 if not is_dimmed else 0.35
+        trace_opacity = 1.0 if not is_dimmed else 0.28
+        accent = CLINICAL_VESSEL_SELECTED if is_focused else CLINICAL_VESSEL
+        centerline_color = (
+            CLINICAL_CENTERLINE_SELECTED if is_focused else CLINICAL_CENTERLINE
+        )
+        label_color = CLINICAL_DIRECTION if is_focused else "#64748b"
 
         if show_centerlines and branch.get("centreline_zyx"):
             centreline = np.asarray(branch["centreline_zyx"], dtype=float)
@@ -148,7 +166,11 @@ def create_slice_figure(
                         x=line_x,
                         y=line_y,
                         mode="lines+markers",
-                        line={"color": centerline_color, "width": 3, "dash": "dot"},
+                        line={
+                            "color": centerline_color,
+                            "width": 3 if is_focused else 2,
+                            "dash": "dot",
+                        },
                         marker={"color": centerline_color, "size": 3},
                         opacity=trace_opacity,
                         name=f"{branch_id} centerline",
@@ -183,13 +205,16 @@ def create_slice_figure(
                     y=[ostium_y],
                     mode="markers+text",
                     marker={
-                        "size": 11,
-                        "color": "#ffe066",
-                        "line": {"color": color, "width": 2},
+                        "size": 12 if is_focused else 10,
+                        "color": CLINICAL_OSTIUM,
+                        "line": {
+                            "color": accent,
+                            "width": 2 if is_focused else 1,
+                        },
                     },
                     text=[f"★ {branch_id}" if is_focused else branch_id],
                     textposition="top center",
-                    textfont={"color": color},
+                    textfont={"color": label_color, "size": 11 if is_focused else 10},
                     opacity=trace_opacity,
                     name=branch_id,
                     legendgroup=branch_id,
@@ -210,10 +235,13 @@ def create_slice_figure(
                     x=[ostium_x, seed_x],
                     y=[ostium_y, seed_y],
                     mode="lines+markers",
-                    line={"color": color, "width": 3},
+                    line={
+                        "color": CLINICAL_DIRECTION,
+                        "width": 3 if is_focused else 2,
+                    },
                     marker={
-                        "color": color,
-                        "size": [0, 12],
+                        "color": CLINICAL_DIRECTION,
+                        "size": [0, 12 if is_focused else 10],
                         "symbol": ["circle", "arrow"],
                         "angleref": "previous",
                     },
@@ -233,9 +261,13 @@ def create_slice_figure(
                     y=[seed_y],
                     mode="markers",
                     marker={
-                        "size": 9,
+                        "size": 10 if is_focused else 8,
                         "symbol": "x" if is_projection else "diamond",
-                        "color": color,
+                        "color": CLINICAL_SEED,
+                        "line": {
+                            "color": accent,
+                            "width": 1 if is_focused else 0,
+                        },
                     },
                     opacity=trace_opacity,
                     name=f"{branch_id} seed",
@@ -258,7 +290,11 @@ def create_slice_figure(
                     x=seed_x + radius * np.cos(angles),
                     y=seed_y + radius * np.sin(angles),
                     mode="lines",
-                    line={"color": color, "width": 2, "dash": "dot"},
+                    line={
+                        "color": CLINICAL_SEED,
+                        "width": 2 if is_focused else 1,
+                        "dash": "dot",
+                    },
                     opacity=trace_opacity,
                     name=f"{branch_id} radius",
                     legendgroup=branch_id,
@@ -291,50 +327,446 @@ def create_slice_figure(
     return figure
 
 
-def _resample_or_smooth_path(points: np.ndarray, num_points: int = 24) -> np.ndarray:
-    """Resample center line points with cumulative arc-length for smooth tube generation."""
+def _path_arc_length_mm(points: np.ndarray) -> float:
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return 0.0
+    return float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+
+
+def _dense_hover_samples(
+    path_pts: np.ndarray,
+    *,
+    step_mm: float = 1.0,
+    extra_tips: Sequence[Sequence[float]] | None = None,
+) -> np.ndarray:
+    """Sample a centerline densely so Scatter3d hover stays hittable in 3D."""
+    pts = np.asarray(path_pts, dtype=float)
+    samples: list[np.ndarray] = []
+    if len(pts) >= 2:
+        length = _path_arc_length_mm(pts)
+        n = max(4, int(np.ceil(max(length, step_mm) / max(step_mm, 0.25))) + 1)
+        n = min(n, 64)
+        if len(pts) >= 3:
+            samples_arr = _resample_or_smooth_path(pts, num_points=n)
+            samples.extend(np.asarray(samples_arr, dtype=float))
+        else:
+            t = np.linspace(0.0, 1.0, n)
+            samples.extend(pts[0][None, :] * (1.0 - t[:, None]) + pts[-1][None, :] * t[:, None])
+    elif len(pts) == 1:
+        samples.append(pts[0])
+    if extra_tips is not None:
+        for tip in extra_tips:
+            samples.append(np.asarray(tip, dtype=float))
+    if not samples:
+        return np.zeros((0, 3), dtype=float)
+    return np.asarray(samples, dtype=float)
+
+
+def _branch_hover_html(
+    branch: dict[str, Any],
+    *,
+    selected: bool = False,
+) -> str:
+    branch_id = str(branch.get("instance_id", "branch"))
+    radius = float(branch.get("radius_mm", 1.0))
+    path_len = float(branch.get("path_length_mm", 0.0))
+    return (
+        f"<b>{branch_id}</b>"
+        + (" <b>[SELECTED]</b>" if selected else "")
+        + f"<br>Radius: {radius:.2f} mm"
+        + f"<br>Trace extent: {path_len:.1f} mm"
+        + "<br>x=%{x:.2f} mm<br>y=%{y:.2f} mm<br>z=%{z:.2f} mm"
+        + "<extra></extra>"
+    )
+
+
+def _mesh_vertex_hover_text(
+    vertices_xyz_mm: np.ndarray,
+    branches: Sequence[dict[str, Any]],
+    *,
+    max_dist_mm: float = 7.0,
+    focused_branch_id: str | None = None,
+) -> list[str]:
+    """Map each mesh vertex to the nearest branch (Plotly Mesh3d can show this on hover).
+
+    Scatter probes inside a Mesh3d never receive hover in Plotly gl3d — the mesh
+    always wins picking. Binding branch text onto the outer mesh vertices is the
+    reliable workaround.
+    """
+    verts = np.asarray(vertices_xyz_mm, dtype=float)
+    if len(verts) == 0:
+        return []
+    if not branches:
+        return ["<b>Aorta</b><br>Vessel tree"] * len(verts)
+
+    anchor_pts: list[np.ndarray] = []
+    anchor_text: list[str] = []
+    for index, branch in enumerate(branches):
+        branch_id = str(branch.get("instance_id", f"branch_{index + 1:03d}"))
+        ostium = np.asarray(branch.get("ostium_xyz_mm", (0, 0, 0)), dtype=float)
+        seed = np.asarray(branch.get("seed_xyz_mm", (0, 0, 0)), dtype=float)
+        raw_path = branch.get("centreline_xyz_mm")
+        if raw_path and len(raw_path) >= 2:
+            path_pts = np.asarray(raw_path, dtype=float)
+        else:
+            path_pts = np.linspace(ostium, seed, 6)
+        samples = _dense_hover_samples(
+            path_pts, step_mm=1.2, extra_tips=(ostium, seed)
+        )
+        selected = focused_branch_id is not None and branch_id == focused_branch_id
+        # Static HTML for mesh vertices (no %{x} placeholders — Mesh3d fills coords).
+        radius = float(branch.get("radius_mm", 1.0))
+        path_len = float(branch.get("path_length_mm", 0.0))
+        label = (
+            f"<b>{branch_id}</b>"
+            + (" <b>[SELECTED]</b>" if selected else "")
+            + f"<br>Radius: {radius:.2f} mm"
+            + f"<br>Trace extent: {path_len:.1f} mm"
+        )
+        for sample in samples:
+            anchor_pts.append(np.asarray(sample, dtype=float))
+            anchor_text.append(label)
+
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(np.asarray(anchor_pts, dtype=float))
+    dists, idxs = tree.query(verts, k=1, workers=-1)
+    hover_text: list[str] = []
+    for dist, idx in zip(np.atleast_1d(dists), np.atleast_1d(idxs)):
+        if float(dist) <= max_dist_mm:
+            hover_text.append(anchor_text[int(idx)])
+        else:
+            hover_text.append("<b>Aorta</b><br>Vessel tree")
+    return hover_text
+
+
+def _adaptive_tube_sample_count(arc_length_mm: float, *, max_points: int = 48) -> int:
+    """Space rings by arc length so short branches don't look like stacked washers."""
+    # ~0.65 mm between cross-sections keeps walls smooth without packing rings.
+    return int(np.clip(round(float(arc_length_mm) / 0.65) + 1, 6, max_points))
+
+
+def _ensure_min_path_length(
+    pts: np.ndarray,
+    radius_mm: float,
+    *,
+    min_length_mm: float | None = None,
+) -> np.ndarray:
+    """Extend the distal tip so short ostium→seed segments read as real pipes."""
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 2:
+        return pts
+    length = _path_arc_length_mm(pts)
+    target = (
+        float(min_length_mm)
+        if min_length_mm is not None
+        else max(9.0, 7.0 * float(radius_mm))
+    )
+    if length >= target - 1e-6:
+        return pts
+    tangent = pts[-1] - pts[-2]
+    norm = float(np.linalg.norm(tangent))
+    if norm < 1e-8:
+        return pts
+    tangent /= norm
+    need = target - length
+    n_extra = max(2, int(np.ceil(need / 0.6)))
+    extras = np.asarray(
+        [pts[-1] + tangent * (need * (i + 1) / n_extra) for i in range(n_extra)],
+        dtype=float,
+    )
+    return np.vstack([pts, extras])
+
+
+def _resample_or_smooth_path(points: np.ndarray, num_points: int = 48) -> np.ndarray:
+    """Spline-smooth and resample a centerline to suppress voxel-step jagginess."""
     if len(points) <= 2:
-        return points
+        return np.asarray(points, dtype=float)
     diffs = np.diff(points, axis=0)
     step_dists = np.linalg.norm(diffs, axis=1)
     valid_idx = np.ones(len(points), dtype=bool)
     valid_idx[1:] = step_dists > 1e-4
-    pts = points[valid_idx]
+    pts = np.asarray(points, dtype=float)[valid_idx]
     if len(pts) <= 2:
         return pts
 
     diffs = np.diff(pts, axis=0)
     step_dists = np.linalg.norm(diffs, axis=1)
     cum_dist = np.insert(np.cumsum(step_dists), 0, 0.0)
-    total_len = cum_dist[-1]
+    total_len = float(cum_dist[-1])
     if total_len < 1e-4:
         return pts[:2]
 
-    target_count = max(8, min(num_points, len(pts) * 2))
+    # Honour the requested count (adaptive callers pass a short-path-friendly size).
+    target_count = int(np.clip(int(num_points), 6, 64))
     target_dists = np.linspace(0.0, total_len, target_count)
+
+    # Prefer a mild smoothing spline so tube walls are not faceted by voxel noise.
+    if len(pts) >= 4:
+        try:
+            from scipy.interpolate import splprep, splev
+
+            u = cum_dist / total_len
+            # s scales with path length / point count: enough to kill stair-steps.
+            smooth = max(0.15, 0.08 * total_len)
+            tck, _ = splprep(
+                [pts[:, 0], pts[:, 1], pts[:, 2]],
+                u=u,
+                s=smooth,
+                k=min(3, len(pts) - 1),
+            )
+            xu, yu, zu = splev(np.linspace(0.0, 1.0, target_count), tck)
+            return np.column_stack([xu, yu, zu])
+        except Exception:
+            pass
+
     resampled = np.zeros((len(target_dists), 3), dtype=float)
     for dim in range(3):
         resampled[:, dim] = np.interp(target_dists, cum_dist, pts[:, dim])
     return resampled
 
 
-def _build_tube_mesh(
-    points: Sequence[Sequence[float]],
+def _radius_profile(
+    n_points: int,
+    seed_radius_mm: float,
+    ostium_radius_mm: float | None,
+) -> np.ndarray:
+    """Nearly constant lumen radius with a gentle cosine taper (avoids bulging)."""
+    base = max(float(seed_radius_mm), 0.35)
+    if ostium_radius_mm is not None and np.isfinite(ostium_radius_mm):
+        proximal = float(np.clip(ostium_radius_mm, base * 0.95, base * 1.25))
+    else:
+        proximal = base * 1.12
+    distal = base * 0.92
+    t = np.linspace(0.0, 1.0, n_points)
+    # Smooth hermite-like blend; no sharp knee that creates surface ridges.
+    w = t * t * (3.0 - 2.0 * t)
+    return proximal * (1.0 - w) + distal * w
+
+
+def _extend_path_into_aorta(pts: np.ndarray, radius_mm: float) -> np.ndarray:
+    """Push the proximal tip slightly into the aorta so the tube reads as a branch root."""
+    if len(pts) < 2:
+        return pts
+    tangent = pts[1] - pts[0]
+    norm = float(np.linalg.norm(tangent))
+    if norm < 1e-8:
+        return pts
+    tangent /= norm
+    extend_mm = max(0.9 * float(radius_mm), 0.8)
+    return np.vstack([pts[0] - tangent * extend_mm, pts])
+
+
+def _polyline_from_points(points: np.ndarray):
+    """Build a single continuous VTK polyline cell (required for seamless tubes)."""
+    assert pv is not None
+    poly = pv.PolyData()
+    poly.points = np.asarray(points, dtype=float)
+    cell = np.arange(0, len(points), dtype=np.int_)
+    cell = np.insert(cell, 0, len(points))
+    poly.lines = cell
+    return poly
+
+
+def _faces_to_ijk(faces: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert VTK/PyVista face array to Plotly Mesh3d i/j/k indices."""
+    faces = np.asarray(faces, dtype=int).ravel()
+    i_indices: list[int] = []
+    j_indices: list[int] = []
+    k_indices: list[int] = []
+    cursor = 0
+    while cursor < len(faces):
+        n = int(faces[cursor])
+        ids = faces[cursor + 1 : cursor + 1 + n]
+        cursor += n + 1
+        if n == 3:
+            i_indices.append(int(ids[0]))
+            j_indices.append(int(ids[1]))
+            k_indices.append(int(ids[2]))
+        elif n > 3:
+            for offset in range(1, n - 1):
+                i_indices.append(int(ids[0]))
+                j_indices.append(int(ids[offset]))
+                k_indices.append(int(ids[offset + 1]))
+    return (
+        np.asarray(i_indices, dtype=int),
+        np.asarray(j_indices, dtype=int),
+        np.asarray(k_indices, dtype=int),
+    )
+
+
+def _smooth_triangle_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    n_iter: int = 40,
+    relaxation: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Laplacian-smooth a triangle surface when PyVista is available."""
+    if not _HAS_PYVISTA or len(vertices) < 4 or len(faces) < 1:
+        return vertices, faces
+    try:
+        faces_vtk = np.hstack(
+            [np.full((len(faces), 1), 3, dtype=np.int64), faces.astype(np.int64)]
+        ).ravel()
+        mesh = pv.PolyData(np.asarray(vertices, dtype=float), faces_vtk)
+        mesh = mesh.smooth(
+            n_iter=n_iter,
+            relaxation_factor=relaxation,
+            feature_smoothing=False,
+            boundary_smoothing=True,
+        )
+        mesh = mesh.triangulate()
+        new_faces = mesh.faces.reshape(-1, 4)[:, 1:]
+        return np.asarray(mesh.points, dtype=float), np.asarray(new_faces, dtype=int)
+    except Exception:
+        return vertices, faces
+
+
+def _offset_mesh_along_normals(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    offset_mm: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Push/pull a surface along point normals (for rim vs lumen shells)."""
+    if abs(float(offset_mm)) < 1e-6:
+        return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=int)
+    if _HAS_PYVISTA and len(vertices) >= 4 and len(faces) >= 1:
+        try:
+            faces_vtk = np.hstack(
+                [np.full((len(faces), 1), 3, dtype=np.int64), faces.astype(np.int64)]
+            ).ravel()
+            mesh = pv.PolyData(np.asarray(vertices, dtype=float), faces_vtk)
+            mesh = mesh.compute_normals(
+                cell_normals=False,
+                point_normals=True,
+                consistent_normals=True,
+                auto_orient_normals=True,
+                inplace=False,
+            )
+            normals = np.asarray(mesh.point_data["Normals"], dtype=float)
+            norms = np.linalg.norm(normals, axis=1, keepdims=True)
+            norms[norms < 1e-8] = 1.0
+            normals = normals / norms
+            offset_verts = np.asarray(mesh.points, dtype=float) + normals * float(
+                offset_mm
+            )
+            offset_faces = mesh.faces.reshape(-1, 4)[:, 1:]
+            return offset_verts, np.asarray(offset_faces, dtype=int)
+        except Exception:
+            pass
+
+    # Fallback without PyVista: crude area-weighted face normals → vertex normals.
+    verts = np.asarray(vertices, dtype=float)
+    faces_arr = np.asarray(faces, dtype=int)
+    normals = np.zeros_like(verts)
+    v0 = verts[faces_arr[:, 0]]
+    v1 = verts[faces_arr[:, 1]]
+    v2 = verts[faces_arr[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0)
+    for axis in range(3):
+        np.add.at(normals[:, axis], faces_arr[:, 0], face_normals[:, axis])
+        np.add.at(normals[:, axis], faces_arr[:, 1], face_normals[:, axis])
+        np.add.at(normals[:, axis], faces_arr[:, 2], face_normals[:, axis])
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms[norms < 1e-8] = 1.0
+    normals = normals / norms
+    return verts + normals * float(offset_mm), faces_arr
+
+
+def _volume_shading_layers(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build translucent inner lumen + darker outer rim shells."""
+    faces = np.asarray(faces, dtype=int)
+    vertices = np.asarray(vertices, dtype=float)
+    inner_verts, inner_faces = _offset_mesh_along_normals(vertices, faces, -0.18)
+    rim_verts, rim_faces = _offset_mesh_along_normals(vertices, faces, 0.32)
+    return {
+        "inner_vertices_xyz_mm": inner_verts,
+        "inner_faces": inner_faces,
+        "rim_vertices_xyz_mm": rim_verts,
+        "rim_faces": rim_faces,
+    }
+
+
+def _prepare_tube_centerline(
+    points: np.ndarray,
     radius: float,
-    n_radial: int = 12,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Build a 3D tubular mesh (vertices, I, J, K) along a 3D centerline path.
-
-    Uses a parallel-transport (Bishop) frame along the curve to prevent
-    artificial twisting and pinching around bends.
-    """
-    raw_pts = np.asarray(points, dtype=float)
-    if len(raw_pts) < 2:
-        return None
-
-    pts = _resample_or_smooth_path(raw_pts)
+    *,
+    max_samples: int = 48,
+) -> np.ndarray | None:
+    """Extend short branch paths and resample by arc length (avoids stacked rings)."""
+    pts = np.asarray(points, dtype=float)
     if len(pts) < 2:
         return None
+    pts = _extend_path_into_aorta(pts, radius)
+    pts = _ensure_min_path_length(pts, radius)
+    n_samples = _adaptive_tube_sample_count(
+        _path_arc_length_mm(pts), max_points=max_samples
+    )
+    pts = _resample_or_smooth_path(pts, num_points=n_samples)
+    return pts if len(pts) >= 2 else None
+
+
+def _build_tube_mesh_pyvista(
+    points: np.ndarray,
+    radius: float,
+    *,
+    ostium_radius_mm: float | None = None,
+    n_sides: int = 32,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Open pipe via PyVista: single outer wall, uncapped ends (no stacked inner rings)."""
+    assert pv is not None
+    pts = _prepare_tube_centerline(np.asarray(points, dtype=float), radius)
+    if pts is None:
+        return None
+    outer_radii = _radius_profile(len(pts), radius, ostium_radius_mm)
+
+    line = _polyline_from_points(pts)
+    outer = line.copy()
+    outer["radius"] = outer_radii
+    n_sides = max(24, int(n_sides))
+    tube = outer.tube(
+        scalars="radius",
+        absolute=True,
+        n_sides=n_sides,
+        capping=False,
+    ).triangulate()
+    if tube.n_points < 8 or tube.n_cells < 1:
+        return None
+    try:
+        tube = tube.smooth(
+            n_iter=20,
+            relaxation_factor=0.08,
+            feature_smoothing=False,
+            boundary_smoothing=False,
+        )
+    except Exception:
+        pass
+    i_idx, j_idx, k_idx = _faces_to_ijk(tube.faces)
+    if i_idx.size == 0:
+        return None
+    return np.asarray(tube.points, dtype=float), i_idx, j_idx, k_idx
+
+
+def _build_tube_mesh_bishop(
+    points: np.ndarray,
+    radius: float,
+    *,
+    ostium_radius_mm: float | None = None,
+    n_radial: int = 16,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Open pipe: smooth proximal blend into aorta; distal end keeps an open-tube lip."""
+    pts = _prepare_tube_centerline(np.asarray(points, dtype=float), radius)
+    if pts is None:
+        return None
+    outer_radii = _radius_profile(len(pts), radius, ostium_radius_mm)
+    # Distal wall thickness only — proximal (aorta side) must not look like a pipe mouth.
+    lip_radii = np.maximum(outer_radii * 0.72, outer_radii - 0.45)
+    lip_radii = np.minimum(lip_radii, outer_radii * 0.88)
 
     tangents = np.zeros_like(pts)
     tangents[0] = pts[1] - pts[0]
@@ -357,7 +789,6 @@ def _build_tube_mesh(
 
     normals = [n0]
     binormals = [b0]
-
     for i in range(1, len(pts)):
         t_prev = tangents[i - 1]
         t_curr = tangents[i]
@@ -366,12 +797,11 @@ def _build_tube_mesh(
         if axis_len < 1e-6:
             ni = normals[-1]
             ni = ni - np.dot(ni, t_curr) * t_curr
-            ni_norm = np.linalg.norm(ni)
-            ni = ni / max(ni_norm, 1e-8)
+            ni = ni / max(np.linalg.norm(ni), 1e-8)
         else:
             axis_unit = axis / axis_len
             cos_theta = np.clip(np.dot(t_prev, t_curr), -1.0, 1.0)
-            theta = np.arccos(cos_theta)
+            theta = float(np.arccos(cos_theta))
             v = normals[-1]
             ni = (
                 v * np.cos(theta)
@@ -379,49 +809,74 @@ def _build_tube_mesh(
                 + axis_unit * np.dot(axis_unit, v) * (1.0 - np.cos(theta))
             )
             ni = ni / max(np.linalg.norm(ni), 1e-8)
-        bi = np.cross(t_curr, ni)
         normals.append(ni)
-        binormals.append(bi)
+        binormals.append(np.cross(t_curr, ni))
+
+    # Drop the most proximal rings that sit at the aorta wall so the fused surface
+    # owns the junction; keep the distal open-pipe tip intact.
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+    )
+    total_len = float(arc[-1]) if len(arc) else 0.0
+    proximal_cut_mm = min(max(1.6, 1.8 * float(radius)), 0.28 * max(total_len, 1e-3))
+    keep = arc >= (proximal_cut_mm - 1e-6)
+    # Always keep enough samples for a real distal tube + open mouth.
+    if int(np.count_nonzero(keep)) < 4:
+        keep = np.ones(len(pts), dtype=bool)
+        keep[: max(0, len(pts) - 4)] = False
+
+    pts = pts[keep]
+    outer_radii = outer_radii[keep]
+    lip_radii = lip_radii[keep]
+    normals = [normals[i] for i, flag in enumerate(keep) if flag]
+    binormals = [binormals[i] for i, flag in enumerate(keep) if flag]
 
     angles = np.linspace(0.0, 2.0 * np.pi, n_radial, endpoint=False)
     cos_a = np.cos(angles)
     sin_a = np.sin(angles)
-
-    vertices_list = []
-    effective_radius = max(float(radius), 0.35)
-    for p, n, b in zip(pts, normals, binormals):
-        ring = p[None, :] + effective_radius * (
-            cos_a[:, None] * n[None, :] + sin_a[:, None] * b[None, :]
+    outer_rings = []
+    for p, n, b, r_out in zip(pts, normals, binormals, outer_radii):
+        outer_rings.append(
+            p[None, :]
+            + float(r_out)
+            * (cos_a[:, None] * n[None, :] + sin_a[:, None] * b[None, :])
         )
-        vertices_list.append(ring)
-    vertices = np.vstack(vertices_list)
+    outer_verts = np.vstack(outer_rings)
+    n_pts = len(pts)
+    last = n_pts - 1
 
-    i_indices = []
-    j_indices = []
-    k_indices = []
-    for i in range(len(pts) - 1):
+    # Distal open-port lip only (outer end = uncapped pipe). No proximal lip.
+    lip_distal = pts[last][None, :] + float(lip_radii[last]) * (
+        cos_a[:, None] * normals[last][None, :]
+        + sin_a[:, None] * binormals[last][None, :]
+    )
+    vertices = np.vstack([outer_verts, lip_distal])
+    lip_distal_base = len(outer_verts)
+
+    i_indices: list[int] = []
+    j_indices: list[int] = []
+    k_indices: list[int] = []
+
+    def _quad(a: int, b: int, c: int, d: int) -> None:
+        i_indices.extend([a, a])
+        j_indices.extend([b, c])
+        k_indices.extend([c, d])
+
+    for i in range(n_pts - 1):
         for j in range(n_radial):
             jn = (j + 1) % n_radial
-            p00 = i * n_radial + j
-            p01 = i * n_radial + jn
-            p10 = (i + 1) * n_radial + j
-            p11 = (i + 1) * n_radial + jn
-            i_indices.extend([p00, p01])
-            j_indices.extend([p10, p10])
-            k_indices.extend([p01, p11])
+            o00 = i * n_radial + j
+            o01 = i * n_radial + jn
+            o10 = (i + 1) * n_radial + j
+            o11 = (i + 1) * n_radial + jn
+            _quad(o00, o10, o11, o01)
 
-    start_cap_idx = len(vertices)
-    end_cap_idx = len(vertices) + 1
-    vertices = np.vstack([vertices, pts[0], pts[-1]])
+    # Distal annular mouth only — lumen stays open, pipe look preserved at outer tip.
     for j in range(n_radial):
         jn = (j + 1) % n_radial
-        i_indices.append(start_cap_idx)
-        j_indices.append(jn)
-        k_indices.append(j)
-
-        i_indices.append(end_cap_idx)
-        j_indices.append((len(pts) - 1) * n_radial + j)
-        k_indices.append((len(pts) - 1) * n_radial + jn)
+        o0 = last * n_radial + j
+        o1 = last * n_radial + jn
+        _quad(o0, o1, lip_distal_base + jn, lip_distal_base + j)
 
     return (
         vertices,
@@ -431,20 +886,172 @@ def _build_tube_mesh(
     )
 
 
+def _build_tube_mesh(
+    points: Sequence[Sequence[float]],
+    radius: float,
+    *,
+    ostium_radius_mm: float | None = None,
+    n_radial: int = 32,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Branch tube: smooth aorta-side junction; distal tip stays an open pipe."""
+    raw_pts = np.asarray(points, dtype=float)
+    if len(raw_pts) < 2:
+        return None
+
+    # Prefer Bishop builder: proximal blend + distal annular open mouth.
+    mesh = _build_tube_mesh_bishop(
+        raw_pts,
+        radius,
+        ostium_radius_mm=ostium_radius_mm,
+        n_radial=max(16, min(int(n_radial), 28)),
+    )
+    if mesh is not None:
+        return mesh
+
+    if _HAS_PYVISTA:
+        try:
+            return _build_tube_mesh_pyvista(
+                raw_pts,
+                radius,
+                ostium_radius_mm=ostium_radius_mm,
+                n_sides=n_radial,
+            )
+        except Exception:
+            return None
+    return None
+
+
+def _stamp_sphere(
+    volume: np.ndarray,
+    center_zyx: Sequence[float],
+    radius_zyx: Sequence[float],
+) -> None:
+    """OR an anisotropic sphere into a boolean volume (in-place)."""
+    cz, cy, cx = (float(v) for v in center_zyx)
+    rz, ry, rx = (max(float(v), 0.55) for v in radius_zyx)
+    shape = volume.shape
+    z0 = max(0, int(np.floor(cz - rz - 1)))
+    z1 = min(shape[0], int(np.ceil(cz + rz + 2)))
+    y0 = max(0, int(np.floor(cy - ry - 1)))
+    y1 = min(shape[1], int(np.ceil(cy + ry + 2)))
+    x0 = max(0, int(np.floor(cx - rx - 1)))
+    x1 = min(shape[2], int(np.ceil(cx + rx + 2)))
+    if z0 >= z1 or y0 >= y1 or x0 >= x1:
+        return
+    zz, yy, xx = np.ogrid[z0:z1, y0:y1, x0:x1]
+    sphere = (
+        ((zz - cz) / rz) ** 2
+        + ((yy - cy) / ry) ** 2
+        + ((xx - cx) / rx) ** 2
+    ) <= 1.0
+    volume[z0:z1, y0:y1, x0:x1] |= sphere
+
+
+def _fuse_vessel_tree_surface(
+    aorta_mask: np.ndarray,
+    mask_image: sitk.Image,
+    branches: Iterable[dict[str, Any]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stamp branch tubes into the aorta mask and extract one smooth surface.
+
+    Voxel union + morphological closing + Gaussian isosurface yields organic
+    junctions similar to a reference vessel-tree model, without brittle mesh CSG.
+    """
+    binary = np.asarray(aorta_mask, dtype=bool)
+    branches = list(branches)
+    if not branches:
+        verts_zyx, faces, _, _ = marching_cubes(binary.astype(np.uint8), level=0.5)
+        verts_xyz = _indices_to_physical(verts_zyx, mask_image)
+        return _smooth_triangle_mesh(verts_xyz, faces, n_iter=55, relaxation=0.14)
+
+    # Work in a padded crop for speed on large CTA volumes.
+    occupied = [np.flatnonzero(binary.any(axis=tuple(i for i in range(3) if i != a)))
+                for a in range(3)]
+    pad = 28
+    z0 = max(0, int(occupied[0][0]) - pad)
+    z1 = min(binary.shape[0], int(occupied[0][-1]) + pad + 1)
+    y0 = max(0, int(occupied[1][0]) - pad)
+    y1 = min(binary.shape[1], int(occupied[1][-1]) + pad + 1)
+    x0 = max(0, int(occupied[2][0]) - pad)
+    x1 = min(binary.shape[2], int(occupied[2][-1]) + pad + 1)
+    crop = binary[z0:z1, y0:y1, x0:x1].copy()
+    offset = np.array([z0, y0, x0], dtype=float)
+    spacing_xyz = np.asarray(mask_image.GetSpacing(), dtype=float)
+
+    for branch in branches:
+        ostium = np.asarray(branch.get("ostium_xyz_mm", (0, 0, 0)), dtype=float)
+        seed = np.asarray(branch.get("seed_xyz_mm", (0, 0, 0)), dtype=float)
+        raw_path = branch.get("centreline_xyz_mm")
+        if raw_path and len(raw_path) >= 2:
+            path_pts = np.asarray(raw_path, dtype=float)
+        else:
+            path_pts = np.linspace(ostium, seed, 8)
+        radius = float(branch.get("radius_mm", 1.0))
+        ostium_r = branch.get("ostium_radius_mm")
+        ostium_r = float(ostium_r) if ostium_r is not None else None
+        path_pts = _prepare_tube_centerline(path_pts, radius, max_samples=40)
+        if path_pts is None:
+            continue
+        radii = _radius_profile(len(path_pts), radius, ostium_r)
+        # Inflate enough that sub-voxel / thin CTA branches survive smoothing.
+        radii = np.maximum(radii * 1.25, max(radius, 0.85))
+
+        for point_xyz, radius_mm in zip(path_pts, radii):
+            zyx = np.asarray(physical_xyz_to_zyx(mask_image, point_xyz), dtype=float)
+            local = zyx - offset
+            # Keep at least ~1.4 voxels so thin daughters are not erased.
+            rx = max(float(radius_mm) / max(spacing_xyz[0], 1e-6), 1.4)
+            ry = max(float(radius_mm) / max(spacing_xyz[1], 1e-6), 1.4)
+            rz = max(float(radius_mm) / max(spacing_xyz[2], 1e-6), 1.4)
+            _stamp_sphere(crop, local, (rz, ry, rx))
+
+        # Mild ostium-only fillet (inner junction). Do not alter distal branch tips.
+        fillet_r = max(float(radii[0]) * 1.35, radius * 1.8)
+        direction = path_pts[min(1, len(path_pts) - 1)] - path_pts[0]
+        dnorm = float(np.linalg.norm(direction))
+        direction = direction / dnorm if dnorm > 1e-8 else np.array([0.0, 0.0, 1.0])
+        for step_mm, scale in ((0.0, 1.0), (1.0, 0.85)):
+            point_xyz = ostium - direction * step_mm
+            zyx = np.asarray(physical_xyz_to_zyx(mask_image, point_xyz), dtype=float)
+            local = zyx - offset
+            r_mm = fillet_r * scale
+            rx = max(r_mm / max(spacing_xyz[0], 1e-6), 1.4)
+            ry = max(r_mm / max(spacing_xyz[1], 1e-6), 1.4)
+            rz = max(r_mm / max(spacing_xyz[2], 1e-6), 1.4)
+            _stamp_sphere(crop, local, (rz, ry, rx))
+
+    # Close ostium gaps without eroding thin distal branches away.
+    struct = ndi.generate_binary_structure(3, 1)
+    crop = ndi.binary_closing(crop, structure=struct, iterations=2)
+
+    volume = ndi.gaussian_filter(crop.astype(np.float32), sigma=0.8)
+    verts_local, faces, _, _ = marching_cubes(volume, level=0.38)
+    verts_zyx = verts_local + offset
+    verts_xyz = _indices_to_physical(verts_zyx, mask_image)
+    return _smooth_triangle_mesh(verts_xyz, faces, n_iter=50, relaxation=0.13)
+
+
 def prepare_aorta_3d_geometry(
     mask_np: np.ndarray,
     mask_image: sitk.Image,
     branches: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
-    """Precompute immutable mesh geometry for responsive 3D interactions."""
+    """Precompute fused vessel-tree surface + optional per-branch tubes."""
     binary = np.asarray(mask_np) > 0
     if not np.any(binary):
         raise ValueError("Cannot visualize an empty aorta mask")
 
-    vertices_zyx, faces, _, _ = marching_cubes(
-        binary.astype(np.uint8), level=0.5
+    branches = list(branches)
+    tree_vertices, tree_faces = _fuse_vessel_tree_surface(binary, mask_image, branches)
+    shading = _volume_shading_layers(tree_vertices, tree_faces)
+
+    # Keep an aorta-only surface for the "hide daughters" toggle.
+    verts_zyx, aorta_faces, _, _ = marching_cubes(binary.astype(np.uint8), level=0.5)
+    aorta_vertices = _indices_to_physical(verts_zyx, mask_image)
+    aorta_vertices, aorta_faces = _smooth_triangle_mesh(
+        aorta_vertices, aorta_faces, n_iter=40, relaxation=0.12
     )
-    vertices_xyz_mm = _indices_to_physical(vertices_zyx, mask_image)
+    aorta_shading = _volume_shading_layers(aorta_vertices, aorta_faces)
 
     bounds = []
     for axis in range(3):
@@ -462,15 +1069,33 @@ def prepare_aorta_3d_geometry(
             path_pts = np.asarray(raw_path, dtype=float)
         else:
             path_pts = np.linspace(ostium, seed, 6)
+        # Floor display radius so sub-millimetre CTA twigs stay visible in 3D.
+        display_radius = max(float(branch.get("radius_mm", 1.0)), 0.6)
         branch_meshes[branch_id] = _build_tube_mesh(
-            path_pts, radius=float(branch.get("radius_mm", 1.0))
+            path_pts,
+            radius=display_radius,
+            ostium_radius_mm=(
+                float(branch["ostium_radius_mm"])
+                if branch.get("ostium_radius_mm") is not None
+                else None
+            ),
         )
 
     return {
         "shape_zyx": tuple(binary.shape),
         "bounds_zyx": tuple(bounds),
-        "aorta_vertices_xyz_mm": vertices_xyz_mm,
-        "aorta_faces": faces,
+        "aorta_vertices_xyz_mm": aorta_vertices,
+        "aorta_faces": aorta_faces,
+        "aorta_inner_vertices_xyz_mm": aorta_shading["inner_vertices_xyz_mm"],
+        "aorta_inner_faces": aorta_shading["inner_faces"],
+        "aorta_rim_vertices_xyz_mm": aorta_shading["rim_vertices_xyz_mm"],
+        "aorta_rim_faces": aorta_shading["rim_faces"],
+        "tree_vertices_xyz_mm": tree_vertices,
+        "tree_faces": tree_faces,
+        "tree_inner_vertices_xyz_mm": shading["inner_vertices_xyz_mm"],
+        "tree_inner_faces": shading["inner_faces"],
+        "tree_rim_vertices_xyz_mm": shading["rim_vertices_xyz_mm"],
+        "tree_rim_faces": shading["rim_faces"],
         "branch_meshes": branch_meshes,
     }
 
@@ -489,51 +1114,131 @@ def create_aorta_figure(
     prepared_geometry: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> go.Figure:
-    """Create an interactive 3D aorta mesh with realistic 3D vessel branch tubes."""
+    """Create an interactive 3D fused vessel tree (aorta + daughters, one surface)."""
     branches = list(branches)
     geometry = prepared_geometry or prepare_aorta_3d_geometry(
         mask_np, mask_image, branches
     )
-    vertices_xyz_mm = geometry["aorta_vertices_xyz_mm"]
-    faces = geometry["aorta_faces"]
-    figure = go.Figure(
-        go.Mesh3d(
-            x=vertices_xyz_mm[:, 0],
-            y=vertices_xyz_mm[:, 1],
-            z=vertices_xyz_mm[:, 2],
-            i=faces[:, 0],
-            j=faces[:, 1],
-            k=faces[:, 2],
-            name="Aorta",
-            color="#d94b64",
-            opacity=0.55,
-            flatshading=False,
-            lighting={
-                "ambient": 0.4,
-                "diffuse": 0.8,
-                "specular": 0.2,
-                "roughness": 0.5,
-            },
+    use_tree = show_vessels and geometry.get("tree_vertices_xyz_mm") is not None
+    if use_tree:
+        body_vertices = geometry.get(
+            "tree_inner_vertices_xyz_mm", geometry["tree_vertices_xyz_mm"]
         )
+        body_faces = geometry.get("tree_inner_faces", geometry["tree_faces"])
+        rim_vertices = geometry.get(
+            "tree_rim_vertices_xyz_mm", geometry["tree_vertices_xyz_mm"]
+        )
+        rim_faces = geometry.get("tree_rim_faces", geometry["tree_faces"])
+        body_name = "Vessel lumen"
+        rim_name = "Vessel rim"
+    else:
+        body_vertices = geometry.get(
+            "aorta_inner_vertices_xyz_mm", geometry["aorta_vertices_xyz_mm"]
+        )
+        body_faces = geometry.get("aorta_inner_faces", geometry["aorta_faces"])
+        rim_vertices = geometry.get(
+            "aorta_rim_vertices_xyz_mm", geometry["aorta_vertices_xyz_mm"]
+        )
+        rim_faces = geometry.get("aorta_rim_faces", geometry["aorta_faces"])
+        body_name = "Aorta lumen"
+        rim_name = "Aorta rim"
+
+    volume_lighting = {
+        "ambient": 0.16,
+        "diffuse": 0.95,
+        "specular": 0.62,
+        "roughness": 0.28,
+        "fresnel": 0.35,
+    }
+    light_pos = {"x": 90, "y": 140, "z": 220}
+
+    # Bind branch hover text to the OUTER rim mesh. Plotly gl3d always picks Mesh3d
+    # over interior Scatter3d, so this is the only reliable hover path.
+    rim_hover_text = _mesh_vertex_hover_text(
+        rim_vertices,
+        branches,
+        max_dist_mm=7.5,
+        focused_branch_id=focused_branch_id,
     )
+
+    # Outer rim first (darker edge), then translucent lighter lumen on top.
+    figure = go.Figure(
+        data=[
+            go.Mesh3d(
+                x=rim_vertices[:, 0],
+                y=rim_vertices[:, 1],
+                z=rim_vertices[:, 2],
+                i=rim_faces[:, 0],
+                j=rim_faces[:, 1],
+                k=rim_faces[:, 2],
+                name=rim_name,
+                color=CLINICAL_VESSEL_RIM,
+                opacity=0.78,
+                flatshading=False,
+                lighting=volume_lighting,
+                lightposition=light_pos,
+                legendgroup="tissue",
+                showlegend=True,
+                text=rim_hover_text,
+                hovertext=rim_hover_text,
+                hovertemplate=(
+                    "%{hovertext}"
+                    "<br>x=%{x:.2f} mm<br>y=%{y:.2f} mm<br>z=%{z:.2f} mm"
+                    "<extra></extra>"
+                ),
+                hoverinfo="text",
+            ),
+            go.Mesh3d(
+                x=body_vertices[:, 0],
+                y=body_vertices[:, 1],
+                z=body_vertices[:, 2],
+                i=body_faces[:, 0],
+                j=body_faces[:, 1],
+                k=body_faces[:, 2],
+                name=body_name,
+                color=CLINICAL_VESSEL_INNER,
+                opacity=0.48,
+                flatshading=False,
+                lighting={
+                    "ambient": 0.34,
+                    "diffuse": 0.88,
+                    "specular": 0.45,
+                    "roughness": 0.4,
+                    "fresnel": 0.12,
+                },
+                lightposition=light_pos,
+                legendgroup="tissue",
+                showlegend=True,
+                # Inner shell stays non-interactive so rim hover wins cleanly.
+                hoverinfo="none",
+            ),
+        ]
+    )
+
+    ostium_legend_shown = False
+    seed_legend_shown = False
+    labels_legend_shown = False
 
     for index, branch in enumerate(branches):
         branch_id = str(branch.get("instance_id", f"branch_{index + 1:03d}"))
-        color = BRANCH_COLORS[index % len(BRANCH_COLORS)]
         radius = float(branch.get("radius_mm", 1.0))
         path_len = float(branch.get("path_length_mm", 0.0))
 
         is_focused = focused_branch_id is not None and branch_id == focused_branch_id
         is_dimmed = focused_branch_id is not None and not is_focused
 
-        tube_opacity = 0.98 if is_focused else (0.16 if is_dimmed else 0.92)
-        centerline_w = 7 if is_focused else (2 if is_dimmed else 4)
-        ostium_s = 8 if is_focused else (3 if is_dimmed else 5)
-        seed_s = 9 if is_focused else (3 if is_dimmed else 6)
+        centerline_w = 4 if is_focused else (1 if is_dimmed else 2)
+        ostium_s = 7 if is_focused else (3 if is_dimmed else 4)
+        seed_s = 7 if is_focused else (3 if is_dimmed else 5)
 
         ostium = np.asarray(branch.get("ostium_xyz_mm", (0, 0, 0)), dtype=float)
         seed = np.asarray(branch.get("seed_xyz_mm", (0, 0, 0)), dtype=float)
         direction = np.asarray(branch.get("direction_xyz", (0, 0, 1)), dtype=float)
+        direction_norm = float(np.linalg.norm(direction))
+        if direction_norm > 1e-8:
+            direction = direction / direction_norm
+        else:
+            direction = np.array([0.0, 0.0, 1.0])
 
         raw_path = branch.get("centreline_xyz_mm")
         if raw_path and len(raw_path) >= 2:
@@ -541,9 +1246,11 @@ def create_aorta_figure(
         else:
             path_pts = np.linspace(ostium, seed, 6)
 
-        # 1. Realistic 3D vessel tubular mesh
+        branch_hover = _branch_hover_html(branch, selected=is_focused)
+
         if show_vessels:
-            mesh_data = geometry["branch_meshes"].get(branch_id)
+            mesh_data = geometry.get("branch_meshes", {}).get(branch_id)
+            # Daughter tubes: keep hovertemplate on the protruding mesh surface.
             if mesh_data is not None:
                 verts, I, J, K = mesh_data
                 figure.add_trace(
@@ -554,46 +1261,75 @@ def create_aorta_figure(
                         i=I,
                         j=J,
                         k=K,
-                        name=f"{branch_id} vessel" + (" ★" if is_focused else ""),
-                        color=color,
-                        opacity=tube_opacity,
+                        name=(
+                            "Selected branch"
+                            if is_focused
+                            else f"{branch_id} vessel"
+                        ),
+                        color=CLINICAL_VESSEL if is_focused else CLINICAL_VESSEL_INNER,
+                        opacity=(
+                            0.95
+                            if is_focused
+                            else (0.12 if is_dimmed else 0.88)
+                        ),
                         flatshading=False,
                         lighting={
-                            "ambient": 0.5 if is_focused else 0.45,
-                            "diffuse": 0.9 if is_focused else 0.85,
-                            "specular": 0.45 if is_focused else 0.35,
-                            "roughness": 0.25 if is_focused else 0.35,
+                            "ambient": 0.4 if is_focused else 0.32,
+                            "diffuse": 0.9,
+                            "specular": 0.55 if is_focused else 0.4,
+                            "roughness": 0.25,
                         },
                         legendgroup=branch_id,
-                        showlegend=True,
-                        hoverinfo="text",
-                        hovertext=(
-                            f"<b>{branch_id}</b>"
-                            + (" <b style='color:#ffd166'>[SELECTED]</b>" if is_focused else "")
-                            + f"<br>Radius: {radius:.2f} mm"
-                            + f"<br>Trace extent: {path_len:.1f} mm"
-                        ),
+                        showlegend=bool(is_focused),
+                        hovertemplate=branch_hover,
                     )
                 )
 
-        # 2. High-contrast 3D centerline curve
         if show_centerlines and len(path_pts) >= 2:
+            cl_color = (
+                CLINICAL_CENTERLINE_SELECTED if is_focused else CLINICAL_CENTERLINE
+            )
             figure.add_trace(
                 go.Scatter3d(
                     x=path_pts[:, 0],
                     y=path_pts[:, 1],
                     z=path_pts[:, 2],
                     mode="lines",
-                    line={"color": color, "width": centerline_w},
-                    opacity=1.0 if is_focused else (0.25 if is_dimmed else 1.0),
+                    line={"color": cl_color, "width": centerline_w},
+                    opacity=0.9 if is_focused else (0.1 if is_dimmed else 0.22),
                     name=f"{branch_id} centerline",
-                    legendgroup=branch_id,
                     showlegend=False,
-                    hoverinfo="skip",
+                    hovertemplate=branch_hover,
                 )
             )
 
-        # 3. Ostium and 5 mm Seed landmarks
+        if show_vessels and (not is_dimmed or is_focused):
+            label_offset = direction * max(radius * 2.4, 2.8)
+            label_pos = ostium + label_offset
+            figure.add_trace(
+                go.Scatter3d(
+                    x=[label_pos[0]],
+                    y=[label_pos[1]],
+                    z=[label_pos[2]],
+                    mode="text",
+                    text=[branch_id],
+                    textposition="middle right",
+                    textfont={
+                        "size": 14 if is_focused else 11,
+                        "color": (
+                            CLINICAL_LABEL_SELECTED if is_focused else CLINICAL_LABEL
+                        ),
+                        "family": "Segoe UI, Helvetica, Arial, sans-serif",
+                    },
+                    opacity=1.0 if not is_dimmed else 0.35,
+                    name="Branch labels",
+                    legendgroup="labels",
+                    showlegend=not labels_legend_shown,
+                    hovertemplate=branch_hover,
+                )
+            )
+            labels_legend_shown = True
+
         if show_markers:
             figure.add_trace(
                 go.Scatter3d(
@@ -603,17 +1339,21 @@ def create_aorta_figure(
                     mode="markers",
                     marker={
                         "size": ostium_s,
-                        "color": "#ffe066" if is_focused else "#ffd166",
+                        "color": CLINICAL_OSTIUM,
                         "symbol": "circle",
-                        "line": {"color": "#ffffff" if is_focused else color, "width": 2 if is_focused else 0},
+                        "line": {
+                            "color": CLINICAL_VESSEL,
+                            "width": 2 if is_focused else 1,
+                        },
                     },
-                    name=f"{branch_id} ostium",
-                    legendgroup=branch_id,
-                    showlegend=False,
-                    hoverinfo="text",
-                    hovertext=f"<b>{branch_id}</b><br>Ostium opening",
+                    opacity=1.0 if not is_dimmed else 0.2,
+                    name="Ostium",
+                    legendgroup="markers",
+                    showlegend=not ostium_legend_shown,
+                    hovertemplate=branch_hover,
                 )
             )
+            ostium_legend_shown = True
             figure.add_trace(
                 go.Scatter3d(
                     x=[seed[0]],
@@ -622,22 +1362,22 @@ def create_aorta_figure(
                     mode="markers",
                     marker={
                         "size": seed_s,
-                        "color": color,
+                        "color": CLINICAL_SEED,
                         "symbol": "diamond",
-                        "line": {"color": "#ffffff" if is_focused else color, "width": 2 if is_focused else 0},
+                        "line": {
+                            "color": "#ffffff" if is_focused else CLINICAL_SEED,
+                            "width": 2 if is_focused else 0,
+                        },
                     },
-                    name=f"{branch_id} seed",
-                    legendgroup=branch_id,
-                    showlegend=False,
-                    hoverinfo="text",
-                    hovertext=(
-                        f"<b>{branch_id}</b><br>5 mm Seed landmark<br>"
-                        f"radius={radius:.2f} mm"
-                    ),
+                    opacity=1.0 if not is_dimmed else 0.2,
+                    name="5 mm seed",
+                    legendgroup="markers",
+                    showlegend=not seed_legend_shown,
+                    hovertemplate=branch_hover,
                 )
             )
+            seed_legend_shown = True
 
-        # 4. Optional direction cone (default hidden to avoid overlap clutter)
         if show_cones:
             figure.add_trace(
                 go.Cone(
@@ -650,9 +1390,11 @@ def create_aorta_figure(
                     sizemode="absolute",
                     sizeref=6 if is_focused else 4,
                     showscale=False,
-                    colorscale=[[0, color], [1, color]],
+                    colorscale=[
+                        [0, CLINICAL_DIRECTION],
+                        [1, CLINICAL_DIRECTION],
+                    ],
                     name=f"{branch_id} cone",
-                    legendgroup=branch_id,
                     showlegend=False,
                 )
             )
@@ -671,7 +1413,7 @@ def create_aorta_figure(
         x_max = min(shape_x - 1, x_bound[1] + pad)
 
         corners_zyx = None
-        plane_color = "#00f0ff"
+        plane_color = SLICE_PLANE_COLORS.get(plane_type, "#94a3b8")
         plane_name = f"{plane_type.capitalize()} plane"
         if plane_type == "axial":
             cur_z = max(0, min(shape_z - 1, int(slice_index)))
@@ -682,7 +1424,6 @@ def create_aorta_figure(
                 [cur_z, y_max, x_min],
             ], dtype=float)
             plane_name = f"Axial plane (z={cur_z})"
-            plane_color = "#00f0ff"
         elif plane_type == "coronal":
             cur_y = max(0, min(shape_y - 1, int(slice_index)))
             corners_zyx = np.array([
@@ -692,7 +1433,6 @@ def create_aorta_figure(
                 [z_max, cur_y, x_min],
             ], dtype=float)
             plane_name = f"Coronal plane (y={cur_y})"
-            plane_color = "#2ed573"
         elif plane_type == "sagittal":
             cur_x = max(0, min(shape_x - 1, int(slice_index)))
             corners_zyx = np.array([
@@ -702,7 +1442,6 @@ def create_aorta_figure(
                 [z_min, y_max, cur_x],
             ], dtype=float)
             plane_name = f"Sagittal plane (x={cur_x})"
-            plane_color = "#ffa502"
 
         if corners_zyx is not None:
             corners_xyz = _indices_to_physical(corners_zyx, mask_image)
@@ -715,10 +1454,10 @@ def create_aorta_figure(
                     j=[1, 2],
                     k=[2, 3],
                     color=plane_color,
-                    opacity=0.22,
+                    opacity=0.16,
                     name=plane_name,
                     showlegend=True,
-                    hoverinfo="skip",
+                    hoverinfo="none",
                 )
             )
             closed_perimeter = np.vstack([corners_xyz, corners_xyz[0]])
@@ -728,22 +1467,48 @@ def create_aorta_figure(
                     y=closed_perimeter[:, 1],
                     z=closed_perimeter[:, 2],
                     mode="lines",
-                    line={"color": plane_color, "width": 4},
+                    line={"color": plane_color, "width": 3},
                     name=f"{plane_name} outline",
                     showlegend=False,
-                    hoverinfo="skip",
+                    hoverinfo="none",
                 )
             )
 
     figure.update_layout(
         margin={"l": 0, "r": 0, "t": 25, "b": 0},
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
+        font={"color": "#f5f5f5"},
+        hovermode="closest",
         scene={
             "aspectmode": "data",
             "xaxis_title": "x (mm)",
             "yaxis_title": "y (mm)",
             "zaxis_title": "z (mm)",
+            "xaxis": {
+                "backgroundcolor": "#000000",
+                "gridcolor": "#222222",
+                "showbackground": True,
+            },
+            "yaxis": {
+                "backgroundcolor": "#000000",
+                "gridcolor": "#222222",
+                "showbackground": True,
+            },
+            "zaxis": {
+                "backgroundcolor": "#000000",
+                "gridcolor": "#222222",
+                "showbackground": True,
+            },
+            "bgcolor": "#000000",
+            "hovermode": "closest",
         },
-        legend={"orientation": "h"},
+        legend={
+            "orientation": "h",
+            "bgcolor": "rgba(0,0,0,0.55)",
+            "bordercolor": "#333333",
+            "font": {"size": 11},
+        },
     )
     return figure
 

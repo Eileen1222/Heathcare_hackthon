@@ -241,6 +241,11 @@ if "prediction" not in st.session_state:
     st.session_state.prediction = None
 if "prepared_3d_geometry" not in st.session_state:
     st.session_state.prepared_3d_geometry = None
+# Bump when 3D mesh generation changes so stale session caches are rebuilt.
+_GEOMETRY_CACHE_VERSION = 9
+if st.session_state.get("geometry_cache_version") != _GEOMETRY_CACHE_VERSION:
+    st.session_state.prepared_3d_geometry = None
+    st.session_state.geometry_cache_version = _GEOMETRY_CACHE_VERSION
 
 with st.sidebar:
     st.header("Case input")
@@ -545,6 +550,7 @@ aorta_figure.update_layout(height=580)
 st.plotly_chart(
     aorta_figure,
     use_container_width=True,
+    config={"displayModeBar": True, "scrollZoom": True},
 )
 
 
