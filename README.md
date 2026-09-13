@@ -1,6 +1,6 @@
-# BranchSeed
+# Aortix
 
-BranchSeed is a CPU-friendly prototype for detecting direct daughter arteries
+AortiX is a CPU-friendly prototype for detecting direct daughter arteries
 from a CTA volume and an aorta mask. The repository has one shared Python
 pipeline and two entry points:
 
