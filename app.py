@@ -20,9 +20,107 @@ from src.visualization import (
 )
 
 
-st.set_page_config(page_title="BranchSeed", page_icon="🫀", layout="wide")
-st.title("BranchSeed")
-st.caption("Automatic direct aortic daughter-artery detection from CTA")
+st.set_page_config(page_title="AortiX", page_icon="🫀", layout="wide")
+st.markdown(
+    """
+    <style>
+      header[data-testid="stHeader"] {
+        background: transparent;
+      }
+      header[data-testid="stHeader"] button,
+      header[data-testid="stHeader"] svg {
+        color: #e2e8f0;
+        fill: #e2e8f0;
+      }
+      div[data-testid="stElementContainer"]:has(.aortix-topbar) {
+        position: fixed;
+        inset: 0 0 auto 0;
+        z-index: 999;
+      }
+      .aortix-topbar {
+        box-sizing: border-box;
+        min-height: 64px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0 5rem;
+        text-align: center;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.24);
+        background: rgba(10, 16, 28, 0.94);
+        backdrop-filter: blur(14px);
+        color: #f8fafc;
+        font-size: 1.05rem;
+        letter-spacing: -0.01em;
+      }
+      .aortix-topbar strong {
+        color: #22d3ee;
+        font-size: 1.35rem;
+        letter-spacing: -0.025em;
+      }
+      .aortix-divider {
+        margin: 0 0.75rem;
+        color: #64748b;
+      }
+      .case-overview-card {
+        margin: 1.5rem 0 1rem;
+        padding: 0.4rem 0;
+      }
+      .case-overview-header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 0.8rem;
+      }
+      .case-overview-eyebrow,
+      .case-overview-label {
+        color: #64748b;
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .case-overview-id {
+        font-size: 0.95rem;
+        font-weight: 650;
+      }
+      .case-overview-stats {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .case-overview-stat {
+        padding: 0 1rem;
+        border-left: 1px solid rgba(148, 163, 184, 0.28);
+      }
+      .case-overview-stat:first-child {
+        padding-left: 0;
+        border-left: 0;
+      }
+      .case-overview-value {
+        margin-top: 0.2rem;
+        font-size: 1rem;
+        font-weight: 650;
+      }
+      @media (max-width: 700px) {
+        .aortix-topbar {
+          padding-left: 3.25rem;
+          font-size: 0.86rem;
+        }
+        .aortix-topbar strong {
+          font-size: 1.1rem;
+        }
+        .case-overview-stats {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+    <div class="aortix-topbar">
+      <strong>AortiX</strong>
+      <span class="aortix-divider">|</span>
+      <span>Intelligent Aortic Branch Analysis</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 def upload_signature(upload: Any) -> tuple[str, int, str | None]:
@@ -222,9 +320,39 @@ if st.session_state.prepared_3d_geometry is None:
         result["mask_np"], result["mask_image"], result["branches"]
     )
 prediction = st.session_state.prediction
-st.success(f'Detected {len(result["branches"])} candidate branches')
-
-viewer_col, details_col = st.columns([2, 1])
+volume_size = result["image"].GetSize()
+volume_spacing = result["image"].GetSpacing()
+case_id_display = html.escape(str(st.session_state.active_case_id))
+st.markdown(
+    f"""
+    <div class="case-overview-card">
+      <div class="case-overview-header">
+        <div class="case-overview-eyebrow">Case overview</div>
+        <div class="case-overview-id">{case_id_display}</div>
+      </div>
+      <div class="case-overview-stats">
+        <div class="case-overview-stat">
+          <div class="case-overview-label">Candidate branches</div>
+          <div class="case-overview-value">{len(result["branches"])}</div>
+        </div>
+        <div class="case-overview-stat">
+          <div class="case-overview-label">Volume dimensions</div>
+          <div class="case-overview-value">
+            {volume_size[0]} × {volume_size[1]} × {volume_size[2]}
+          </div>
+        </div>
+        <div class="case-overview-stat">
+          <div class="case-overview-label">Voxel spacing</div>
+          <div class="case-overview-value">
+            {volume_spacing[0]:.2f} × {volume_spacing[1]:.2f} ×
+            {volume_spacing[2]:.2f} mm
+          </div>
+        </div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Initialize interactive linkage session states
 if "slice_z" not in st.session_state:
@@ -236,71 +364,7 @@ if "slice_x" not in st.session_state:
 if "focused_branch_id" not in st.session_state:
     st.session_state.focused_branch_id = None
 
-with viewer_col:
-    st.subheader("Interactive 3D aorta & branch vessels")
-    c3d_1, c3d_2, c3d_3, c3d_4 = st.columns([1, 1, 1, 1])
-    with c3d_1:
-        show_vessel_tubes = st.checkbox(
-            "Vessel tubes", value=True, key="c3d_tubes"
-        )
-    with c3d_2:
-        show_centerlines_3d = st.checkbox(
-            "Centerlines", value=True, key="c3d_centerlines"
-        )
-    with c3d_3:
-        show_slice_plane_3d = st.checkbox(
-            "2D Slice plane", value=True, key="c3d_plane"
-        )
-    with c3d_4:
-        c3d_plane_type = st.selectbox(
-            "Plane",
-            ["Axial (Z)", "Coronal (Y)", "Sagittal (X)"],
-            key="c3d_plane_type",
-            label_visibility="collapsed",
-        )
-
-    slice_plane_info = None
-    if show_slice_plane_3d:
-        if "Axial" in c3d_plane_type:
-            slice_plane_info = ("axial", int(st.session_state.slice_z))
-        elif "Coronal" in c3d_plane_type:
-            slice_plane_info = ("coronal", int(st.session_state.slice_y))
-        else:
-            slice_plane_info = ("sagittal", int(st.session_state.slice_x))
-
-    aorta_figure = create_aorta_figure(
-        result["mask_np"],
-        result["mask_image"],
-        result["branches"],
-        show_vessels=show_vessel_tubes,
-        show_centerlines=show_centerlines_3d,
-        show_cones=False,
-        focused_branch_id=st.session_state.focused_branch_id,
-        slice_plane_info=slice_plane_info,
-        prepared_geometry=st.session_state.prepared_3d_geometry,
-    )
-    aorta_figure.update_layout(height=580)
-    st.plotly_chart(
-        aorta_figure,
-        use_container_width=True,
-    )
-
-with details_col:
-    st.subheader("Prediction")
-    prediction_text = json.dumps(prediction, indent=2)
-    render_prediction_viewer(prediction_text)
-    payload = prediction_text.encode("utf-8")
-    st.download_button(
-        "Download prediction.json",
-        data=payload,
-        file_name=f"{st.session_state.active_case_id}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
 # --- Clinical Synchronizer & Branch Inspector ---
-st.divider()
-st.subheader("🔍 Clinical Branch Inspector & 3D ↔ 2D Synchronizer")
 branch_list = result["branches"]
 branch_ids = [str(b["instance_id"]) for b in branch_list]
 select_options = ["None (Overview)"] + branch_ids
@@ -360,6 +424,8 @@ focused_branch = next(
     None,
 )
 
+st.divider()
+st.subheader("Clinical Branch Inspector & 3D ↔ 2D Synchronizer")
 sync_c1, sync_c2, sync_c3, sync_c4 = st.columns([3, 2, 2, 2])
 with sync_c1:
     st.selectbox(
@@ -374,7 +440,7 @@ with sync_c2:
     st.write("")
     st.write("")
     st.button(
-        "🎯 Jump 2D to Ostium",
+        "Jump 2D to Ostium",
         use_container_width=True,
         disabled=focused_branch is None,
         on_click=jump_to_branch,
@@ -385,7 +451,7 @@ with sync_c3:
     st.write("")
     st.write("")
     st.button(
-        "📍 Jump 2D to 5mm Seed",
+        "Jump 2D to 5mm Seed",
         use_container_width=True,
         disabled=focused_branch is None,
         on_click=jump_to_branch,
@@ -396,7 +462,7 @@ with sync_c4:
     st.write("")
     st.write("")
     st.button(
-        "✖ Reset Focus",
+        "Reset",
         use_container_width=True,
         disabled=focused_branch is None,
         on_click=reset_branch_focus,
@@ -432,6 +498,54 @@ if focused_branch:
         f"{seed_hu} HU",
         "Lumen confirmed" if seed_hu >= 180 else "Tissue boundary",
     )
+
+st.subheader("Interactive 3D aorta & branch vessels")
+c3d_1, c3d_2, c3d_3, c3d_4 = st.columns([1, 1, 1, 1])
+with c3d_1:
+    show_vessel_tubes = st.checkbox(
+        "Vessel tubes", value=True, key="c3d_tubes"
+    )
+with c3d_2:
+    show_centerlines_3d = st.checkbox(
+        "Centerlines", value=True, key="c3d_centerlines"
+    )
+with c3d_3:
+    show_slice_plane_3d = st.checkbox(
+        "2D Slice plane", value=True, key="c3d_plane"
+    )
+with c3d_4:
+    c3d_plane_type = st.selectbox(
+        "Plane",
+        ["Axial (Z)", "Coronal (Y)", "Sagittal (X)"],
+        key="c3d_plane_type",
+        label_visibility="collapsed",
+    )
+
+slice_plane_info = None
+if show_slice_plane_3d:
+    if "Axial" in c3d_plane_type:
+        slice_plane_info = ("axial", int(st.session_state.slice_z))
+    elif "Coronal" in c3d_plane_type:
+        slice_plane_info = ("coronal", int(st.session_state.slice_y))
+    else:
+        slice_plane_info = ("sagittal", int(st.session_state.slice_x))
+
+aorta_figure = create_aorta_figure(
+    result["mask_np"],
+    result["mask_image"],
+    result["branches"],
+    show_vessels=show_vessel_tubes,
+    show_centerlines=show_centerlines_3d,
+    show_cones=False,
+    focused_branch_id=st.session_state.focused_branch_id,
+    slice_plane_info=slice_plane_info,
+    prepared_geometry=st.session_state.prepared_3d_geometry,
+)
+aorta_figure.update_layout(height=580)
+st.plotly_chart(
+    aorta_figure,
+    use_container_width=True,
+)
 
 
 @st.fragment
@@ -543,3 +657,15 @@ def render_ct_viewer(case_result: dict[str, Any], focused_branch_id: str | None)
 
 
 render_ct_viewer(result, st.session_state.focused_branch_id)
+
+st.divider()
+with st.expander("Prediction JSON", expanded=False):
+    prediction_text = json.dumps(prediction, indent=2)
+    render_prediction_viewer(prediction_text)
+    st.download_button(
+        "Download prediction.json",
+        data=prediction_text.encode("utf-8"),
+        file_name=f"{st.session_state.active_case_id}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
