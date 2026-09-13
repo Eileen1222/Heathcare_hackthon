@@ -57,16 +57,6 @@ python -m unittest discover -s tests -v
 
 Never write voxel indices into `ostium_xyz_mm` or `seed_xyz_mm`.
 
-## Team ownership
-
-| Area | Files |
-|---|---|
-| Integration / data | `src/io_utils.py`, `src/pipeline.py`, `run.py` |
-| Detection | `src/preprocess.py`, `src/detection.py` |
-| Geometry / web | `src/geometry.py`, `src/visualization.py`, `app.py` |
-
-Suggested branches: `feature/io-pipeline`, `feature/detection`, and
-`feature/web-visualization`.
 
 ## Data layout
 
