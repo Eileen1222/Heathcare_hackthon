@@ -58,14 +58,30 @@ class DetectionConfig:
     duplicate_overlap_fraction: float = 0.60
     duplicate_gap_hu: float = 50.0
     duplicate_gap_fraction: float = 0.70
-    same_ostium_radius_factor: float = 2.0
-    # User-selected strict duplicate tolerance: only nearly identical tracks
-    # may contribute to the continuous centreline-overlap rule test.
-    duplicate_centreline_overlap_mm: float = 5.0
-    duplicate_centreline_distance_mm: float = 0.1
-    min_section_contrast_hu: float = 25.0
-    min_section_contrast_fraction: float = 0.18
-    min_radial_progress_mm: float = 0.35
+    # Merge only when centreline tracks stay inside a shared lumen for a
+    # sustained distance. Nearby but truly separate origins must remain two.
+    duplicate_centreline_overlap_mm: float = 3.0
+    # Absolute floor; the effective distance is radius-aware (see below).
+    duplicate_centreline_distance_mm: float = 0.3
+
+
+def _effective_centreline_distance_mm(
+    first_radius_mm: float,
+    second_radius_mm: float,
+    config: DetectionConfig,
+) -> float:
+    """Distance threshold for treating two tracks as the same lumen.
+
+    Uses a fraction of the combined seed radii so thicker vessels can tolerate
+    modest centreline jitter, while preserving a small absolute floor for thin
+    branches. This is intentionally not an ostium-distance rule: two nearby but
+    truly separate openings must still survive when their paths diverge.
+    """
+    combined = max(0.0, float(first_radius_mm)) + max(0.0, float(second_radius_mm))
+    return max(
+        float(config.duplicate_centreline_distance_mm),
+        float(config.duplicate_overlap_radius_factor) * combined,
+    )
 
 
 def _bbox(binary: np.ndarray, margin: np.ndarray) -> tuple[slice, ...]:
@@ -472,7 +488,7 @@ def _duplicate_evidence(
     first_dense=None,
     second_dense=None,
 ):
-    """Use a low-HU gap first, then test sustained centreline overlap."""
+    """Use a low-HU gap first, then test sustained lumen-scale centreline overlap."""
     common_end = min(float(first["path_length_mm"]), float(second["path_length_mm"]),
                      config.max_path_length_mm)
     tail_start = max(config.seed_distance_mm,
@@ -501,10 +517,14 @@ def _duplicate_evidence(
     clear_intensity_gap = (
         gap_stations >= 3 and gap_fraction >= config.duplicate_gap_fraction
     )
+    centreline_distance = _effective_centreline_distance_mm(
+        first["radius_mm"], second["radius_mm"], config
+    )
     evidence = {
         "same_component": bool(same_component),
         "common_length_mm": common_end,
         "centreline_overlap_threshold_mm": config.duplicate_centreline_overlap_mm,
+        "centreline_distance_threshold_mm": float(centreline_distance),
         "comparable": True,
         "distal_separation_mm": float(separations[-1]),
         "distal_overlap_fraction": overlap_fraction,
@@ -524,10 +544,13 @@ def _duplicate_evidence(
     centreline_overlap = _centreline_overlap_length_mm(
         first,
         second,
-        config.duplicate_centreline_distance_mm,
+        centreline_distance,
         first_dense=first_dense,
         second_dense=second_dense,
     )
+    # Sustained lumen-scale overlap is the primary merge signal. Distal
+    # proximity alone is reported but never sufficient: two nearby origins that
+    # diverge quickly must remain separate challenge daughters.
     overlap_duplicate = (
         centreline_overlap > config.duplicate_centreline_overlap_mm + 1e-6
     )
@@ -537,7 +560,7 @@ def _duplicate_evidence(
         "centreline_overlap_mm": float(centreline_overlap),
         "reason": (
             "centreline_overlap_over_threshold"
-            if overlap_duplicate else "no_sustained_near_identical_overlap"
+            if overlap_duplicate else "no_sustained_lumen_scale_overlap"
         ),
         "possible_duplicate": overlap_duplicate,
     }
@@ -623,12 +646,12 @@ def _same_ostium_evidence(first, second, image_np, spacing, config):
 
 
 def _remove_duplicate_branches(results, image_np, spacing, config):
-    """Collapse repeated measurements while preserving separate ostia.
+    """Collapse candidates with sustained lumen-scale centreline overlap.
 
-    Fragments of one physical ostium require shared 3D lumen topology, a
-    lumen-sized opening separation and no low-HU gap. The independent strict
-    centreline rule remains <0.1 mm for >5 mm. A persistent low-HU interval
-    preserves two distinct vessels.
+    A pair is eligible for merging when their centrelines remain within a
+    radius-aware distance for longer than the configured overlap length. A
+    persistent low-HU interval preserves two distinct vessels. Distal proximity
+    alone, or nearby ostia that quickly diverge, never trigger a merge.
     """
     if len(results) < 2:
         for branch in results:
@@ -661,32 +684,17 @@ def _remove_duplicate_branches(results, image_np, spacing, config):
     duplicate_pairs = []
     for first in range(len(results)):
         for second in range(first + 1, len(results)):
-            same_component = (
-                results[first]["_component_id"]
-                == results[second]["_component_id"]
+            centreline_distance = _effective_centreline_distance_mm(
+                results[first]["radius_mm"],
+                results[second]["radius_mm"],
+                config,
             )
-            if same_component:
-                ostium_evidence = _same_ostium_evidence(
-                    results[first],
-                    results[second],
-                    image_np,
-                    spacing,
-                    config,
-                )
-                comparisons[first].append(ostium_evidence)
-                comparisons[second].append(ostium_evidence)
-                if ostium_evidence.get("possible_duplicate", False):
-                    union(first, second)
-                    duplicate_pairs.append(
-                        (first, second, ostium_evidence)
-                    )
-                    continue
-            # A pair that cannot satisfy the strict <0.1 mm centreline rule can
-            # never be merged. Skip its much more expensive 3D HU profile test.
+            # Skip pairs that cannot satisfy the radius-aware centreline rule
+            # before running the more expensive 3D HU profile test.
             if not _dense_paths_can_overlap(
                 dense_paths[first],
                 dense_paths[second],
-                config.duplicate_centreline_distance_mm,
+                centreline_distance,
             ):
                 skipped_distant[first] += 1
                 skipped_distant[second] += 1
@@ -1191,26 +1199,10 @@ def _detect_branches_once(
         branch["instance_id"] = f"branch_{index:03d}"
     if duplicate_count:
         warnings.warn(
-            f"Removed {duplicate_count} repeated branch candidate(s) using "
-            "same-ostium connected-lumen evidence or the strict centreline "
-            f"rule (<{config.duplicate_centreline_distance_mm:g} mm for more "
-            f"than {config.duplicate_centreline_overlap_mm:g} mm); a persistent "
-            "low-intensity gap preserves separate vessels.",
-            RuntimeWarning, stacklevel=2,
-        )
-    if radial_rejected:
-        warnings.warn(
-            f"Rejected {radial_rejected} wall-following candidate(s) without "
-            f"at least {config.min_radial_progress_mm:g} mm of combined "
-            "wall-normal separation evidence.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-    if early_forks_retained:
-        warnings.warn(
-            f"Retained {early_forks_retained} direct common trunk candidate(s) "
-            f"whose first bifurcation is before {config.seed_distance_mm:g} mm; "
-            "each seed lies on the longest existing connected downstream route.",
+            f"Removed {duplicate_count} possible duplicate branch candidate(s) "
+            f"because their centrelines remained within a radius-aware lumen "
+            f"distance for more than "
+            f"{config.duplicate_centreline_overlap_mm:g} mm.",
             RuntimeWarning, stacklevel=2,
         )
     if early_forks_too_short:
